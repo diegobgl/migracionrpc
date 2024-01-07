@@ -12,12 +12,23 @@ class ProductMigration(models.Model):
     username = fields.Char('Usuario')
     password = fields.Char('Contraseña')
 
-    # Método para conectarse a Odoo 16
+    # # Método para conectarse a Odoo 16
+    # def connect_to_odoo16(self):
+    #     common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(self.url))
+    #     uid = common.authenticate(self.db, self.username, self.password, {})
+    #     models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(self.url))
+    #     return uid, models
+
+
     def connect_to_odoo16(self):
-        common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(self.url))
-        uid = common.authenticate(self.db, self.username, self.password, {})
-        models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(self.url))
-        return uid, models
+        try:
+            common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(self.url))
+            uid = common.authenticate(self.db, self.username, self.password, {})
+            models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(self.url))
+            return uid, models
+        except Exception as e:
+            _logger.error('Error al conectar a Odoo 16: %s', e)
+            raise
 
     # Método para obtener los productos de Odoo 16
     @api.model
