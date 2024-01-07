@@ -1,0 +1,12 @@
+<odoo>
+    <!-- Menú principal -->
+    <menuitem id="product_migration_main_menu" 
+              name="Migración de Productos" 
+              sequence="10"/>
+
+    <!-- Submenú para la vista tree y form -->
+    <menuitem id="product_migration_submenu" 
+              name="Ver Migraciones" 
+              parent="product_migration_main_menu" 
+              action="product_migration_action"/>
+</odoo>

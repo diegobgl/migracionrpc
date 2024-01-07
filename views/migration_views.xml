@@ -1,0 +1,41 @@
+<odoo>
+    <record id="view_product_migration_form" model="ir.ui.view">
+        <field name="name">product.migration.form</field>
+        <field name="model">product.migration</field>
+        <field name="arch" type="xml">
+            <form string="Migración de Productos">
+                <sheet>
+                    <group>
+                        <field name="url"/>
+                        <field name="db"/>
+                        <field name="username"/>
+                        <field name="password"/>
+                        <button string="Iniciar Migración" type="object" name="get_products_from_odoo16" class="btn-primary"/>
+                        <button string="procesar Migración" type="object" name="process_and_save_products" class="btn-primary"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_product_migration_tree" model="ir.ui.view">
+        <field name="name">product.migration.tree</field>
+        <field name="model">product.migration</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="url"/>
+                <field name="db"/>
+                <field name="username"/>
+                <!-- Otros campos necesarios -->
+            </tree>
+        </field>
+    </record>
+
+    <record id="product_migration_action" model="ir.actions.act_window">
+        <field name="name">Migración de Productos</field>
+        <field name="type">ir.actions.act_window</field>
+        <field name="res_model">product.migration</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+</odoo>
