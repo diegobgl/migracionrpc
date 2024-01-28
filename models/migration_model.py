@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 from odoo import models, fields, api
 import xmlrpc.client
+import logging
+_logger = logging.getLogger(__name__)
+
 
 class ProductMigration(models.Model):
     _name = 'product.migration'
