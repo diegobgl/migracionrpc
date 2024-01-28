@@ -11,7 +11,7 @@
                         <field name="username"/>
                         <field name="password"/>
                         <button string="Iniciar coneccion" type="object" name="connect_to_odoo16" class="btn-primary"/>
-                        <button string="procesar Migración" type="object" name="process_and_save_products" class="btn-primary"/>
+                        <button string="sincronizar imagenes de productos" type="object" name="sync_product_images_by_name" class="btn-primary"/>
                     </group>
                 </sheet>
             </form>

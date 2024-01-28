@@ -55,3 +55,27 @@ class ProductMigration(models.Model):
                 'name': product['name'],
                 # otros campos...
             })
+
+    @api.model
+    def sync_product_images_by_name(self):
+        # Conexión a Odoo 16
+        uid, models = self.connect_to_odoo16()
+
+        # Obtención de nombres de productos de la BD local
+        local_product_names = self.env['product.product'].search([]).mapped('name')
+
+        # Busqueda de productos en la BD remota que coincidan con los nombres locales
+        remote_product_ids = models.execute_kw(self.db, uid, self.password,
+                                            'product.product', 'search',
+                                            [[['name', 'in', local_product_names]]])
+        remote_products = models.execute_kw(self.db, uid, self.password,
+                                            'product.product', 'read', [remote_product_ids, ['name', 'image_1920']])
+
+        # Sincronización de imágenes
+        for remote_product in remote_products:
+            local_product = self.env['product.product'].search([('name', '=', remote_product['name'])], limit=1)
+            if local_product:
+                local_product.write({'image_1920': remote_product['image_1920']})
+
+        return True
+
