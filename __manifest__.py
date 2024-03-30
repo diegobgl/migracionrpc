@@ -20,7 +20,8 @@
     'data': [
          'security/ir.model.access.csv',
         'views/migration_views.xml',
-        'views/migration_menu.xml',
+        'views/lot_view.xml',
+        'views/migration_menu.xml'
     ],
     'demo': [
         'demo/demo.xml',

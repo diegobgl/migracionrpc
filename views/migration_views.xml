@@ -10,8 +10,10 @@
                         <field name="db"/>
                         <field name="username"/>
                         <field name="password"/>
-                        <button string="Iniciar coneccion" type="object" name="connect_to_odoo16" class="btn-primary"/>
-                        <button string="sincronizar imagenes de productos" type="object" name="sync_product_images_by_name" class="btn-primary"/>
+                        <button string="Iniciar coneccion" type="object" name="connect_to_odoo" class="btn-primary"/>
+                        <button string="sincronizar Productos   " type="object" name="migrate_products" class="btn-primary"/>
+                        <button string="sincronizar imagenes   " type="object" name="migrate_product_images" class="btn-primary"/>
+                        <button string="sincronizar contactos   " type="object" name="migrate_contacts" class="btn-primary"/>
                     </group>
                 </sheet>
             </form>
