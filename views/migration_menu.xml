@@ -9,4 +9,10 @@
               name="Ver Migraciones" 
               parent="product_migration_main_menu" 
               action="product_migration_action"/>
+
+    <!-- Submenú para la vista tree y form -->
+    <menuitem id="product_lot_submenu" 
+              name="Ver lotes descargados" 
+              parent="product_migration_main_menu" 
+              action="product_data_json_action_tree"/>
 </odoo>
