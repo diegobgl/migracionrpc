@@ -84,13 +84,12 @@ class ProductMigration(models.Model):
     def migrate_products(self):
         """
         Migra productos activos desde una base remota Odoo a la instancia local en lotes.
-        Evita duplicados y sólo consulta datos remotos.
+        Evita duplicados, ignora errores de códigos de barras duplicados y solo consulta datos remotos.
         """
         BATCH_SIZE = 100
         uid, models = self.connect_to_odoo()
 
         try:
-            # Solo productos activos
             total_products = models.execute_kw(self.db, uid, self.password,
                                             'product.template', 'search_count', [[('active', '=', True)]])
             _logger.info('Total de productos activos a migrar: %s', total_products)
@@ -107,7 +106,7 @@ class ProductMigration(models.Model):
                     default_code = product_data.get('default_code')
                     name = product_data.get('name')
 
-                    # Buscar duplicado local por default_code o name
+                    # Evitar duplicados locales
                     domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
                     existing_product = self.env['product.template'].sudo().search(domain, limit=1)
 
@@ -124,57 +123,25 @@ class ProductMigration(models.Model):
                         'barcode': product_data.get('barcode'),
                     }
 
-                    new_product = self.env['product.template'].sudo().create(product_vals)
-                    _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
+                    try:
+                        new_product = self.env['product.template'].sudo().create(product_vals)
+                        _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
+                    except Exception as e:
+                        # Intenta nuevamente sin barcode si falla
+                        _logger.warning(f"Error al crear producto '{name}' con barcode '{product_vals.get('barcode')}': {e}")
+                        product_vals['barcode'] = False
+                        try:
+                            new_product = self.env['product.template'].sudo().create(product_vals)
+                            _logger.info(f"Producto creado sin barcode: {new_product.name}")
+                        except Exception as e2:
+                            _logger.error(f"No se pudo crear el producto '{name}' ni siquiera sin barcode: {e2}")
 
         except Exception as e:
-            _logger.error(f"Error al migrar productos en lote: {e}")
-            raise UserError(f"Error al migrar productos: {str(e)}")
+            _logger.error(f"Error general en la migración de productos: {e}")
+            raise UserError(f"Error general en la migración: {str(e)}")
 
-        #@api.multi
 
-    def migrate_products(self):
-        """
-        Función para migrar productos desde una base de datos Odoo remota a la local.
-        Se enfoca en la creación de nuevos productos en la base de datos local,
-        omitiendo la asignación de categorías.
-        """
-        uid, models = self.connect_to_odoo()
 
-        try:
-            # Obtener IDs de todos los productos en la instancia remota
-            product_ids = models.execute_kw(self.db, uid, self.password,
-                                            'product.template', 'search', [[]])
-
-            _logger.info('Se encontraron %s productos para migrar.', len(product_ids))
-
-            for product_id in product_ids:
-                # Obtener detalles de un solo producto incluyendo los campos requeridos
-                fields_to_read = ['name', 'default_code', 'list_price', 'standard_price', 'active', 'barcode']
-                product_data = models.execute_kw(self.db, uid, self.password,
-                                                'product.template', 'read', [product_id, fields_to_read])
-
-                if product_data:
-                    product_data = product_data[0]
-
-                    # Preparar valores para la creación del producto
-                    product_vals = {
-                        'name': product_data['name'],
-                        'default_code': product_data['default_code'],
-                        'list_price': product_data['list_price'],
-                        'standard_price': product_data['standard_price'],
-                        'active': product_data['active'],
-                        'barcode': product_data['barcode'],
-                        # 'categ_id': No se asigna categoría
-                    }
-
-                    # Crear el producto en la base de datos local
-                    new_product = self.env['product.template'].create(product_vals)
-                    _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
-
-        except Exception as e:
-            _logger.error(f"Error al migrar productos: {e}")
-            raise
 
 
     def migrate_product_images(self):
