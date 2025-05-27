@@ -10,7 +10,6 @@ import psycopg2
 
 
 
-
 _logger = logging.getLogger(__name__)
 
 
@@ -82,6 +81,46 @@ class ProductMigration(models.Model):
         except Exception as e:
             _logger.error(f"Error durante la migración de imágenes: {e}")
 
+
+    def migrate_contacts(self):
+        uid, models = self.connect_to_odoo()
+        contacts = models.execute_kw(self.db, uid, self.password,
+                                     'res.partner', 'search_read',
+                                     [[]],
+                                     {'fields': ['is_company', 'name', 'street', 'city', 'state_id', 'country_id',
+                                                 'vat', 'function', 'phone', 'email', 'l10n_cl_dte_email']})
+        
+        for contact in contacts:
+            try:
+                # Preparación y mapeo de campos de Odoo 17 a Odoo 15
+                local_contact_vals = {
+                    'is_company': contact['is_company'],
+                    'name': contact['name'],
+                    'street': contact.get('street', ''),
+                    # Asume que tienes campos personalizados en Odoo 15 para los siguientes datos
+                    'document_number': contact.get('vat', ''),
+                    'phone': contact.get('phone', ''),
+                    'email': contact.get('email', ''),
+                    'dte_email': contact.get('l10n_cl_dte_email', ''),
+                    # Añade aquí cualquier otro mapeo de campos necesario
+                }
+
+                # Buscar si existe un contacto con el mismo nombre y número de documento en la base de datos local
+                existing_contact = self.env['res.partner'].search([('name', '=', contact['name']), ('vat', '=', contact.get('vat', ''))], limit=1)
+                
+                if existing_contact:
+                    existing_contact.write(local_contact_vals)
+                    _logger.info(f"Contacto actualizado: {contact['name']}")
+                else:
+                    self.env['res.partner'].create(local_contact_vals)
+                    _logger.info(f"Contacto creado: {contact['name']}")
+                    
+            except Exception as e:
+                _logger.error(f"Error al migrar el contacto {contact['name']}: {e}")
+
+        _logger.info("Migración de contactos completada.")
+
+
     def migrate_products(self):
         """
         Migra productos activos desde Odoo 12 (remoto) a Odoo 16 (local).
@@ -148,6 +187,7 @@ class ProductMigration(models.Model):
         except Exception as e:
             _logger.error(f"Error general en la migración de productos: {e}")
             raise UserError(f"Error general en la migración: {str(e)}")
+
 
 
 
