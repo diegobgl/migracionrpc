@@ -85,11 +85,14 @@ class ProductMigration(models.Model):
 
     def migrate_products(self):
         """
-        Migra productos activos desde una base remota Odoo a la instancia local en lotes.
-        Ignora duplicados y errores individuales, especialmente los relacionados con código de barras.
+        Migra productos activos desde Odoo 12 (remoto) a Odoo 16 (local).
+        Omite productos con códigos de barras ya migrados o existentes.
         """
         BATCH_SIZE = 100
         uid, models = self.connect_to_odoo()
+
+        # Para evitar duplicados de barcode en memoria durante el proceso
+        barcodes_seen = set()
 
         try:
             total_products = models.execute_kw(self.db, uid, self.password,
@@ -108,14 +111,25 @@ class ProductMigration(models.Model):
                     try:
                         default_code = product_data.get('default_code')
                         name = product_data.get('name')
+                        barcode = product_data.get('barcode')
 
-                        # Evitar duplicados locales
+                        # Verificar existencia por default_code o name
                         domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
                         existing_product = self.env['product.template'].sudo().search(domain, limit=1)
-
                         if existing_product:
                             _logger.info(f"Producto ya existe localmente: {existing_product.name}, se omite.")
                             continue
+
+                        # Verificar si barcode ya existe en la BD local o ya se ha procesado en esta sesión
+                        if barcode:
+                            if barcode in barcodes_seen:
+                                _logger.warning(f"Barcode duplicado ya visto en esta sesión: {barcode}, se omite.")
+                                continue
+                            existing_barcode = self.env['product.template'].sudo().search([('barcode', '=', barcode)], limit=1)
+                            if existing_barcode:
+                                _logger.warning(f"Barcode ya existe en local: {barcode}, se omite.")
+                                continue
+                            barcodes_seen.add(barcode)
 
                         product_vals = {
                             'name': name,
@@ -123,23 +137,14 @@ class ProductMigration(models.Model):
                             'list_price': product_data.get('list_price'),
                             'standard_price': product_data.get('standard_price'),
                             'active': product_data.get('active'),
-                            'barcode': product_data.get('barcode'),
+                            'barcode': barcode,
                         }
 
-                        try:
-                            new_product = self.env['product.template'].sudo().create(product_vals)
-                            _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
-                        except Exception as e:
-                            if 'barcode' in str(e) and 'already exists' in str(e):
-                                _logger.warning(f"Código de barras duplicado para {name}, reintentando sin barcode.")
-                                product_vals['barcode'] = False
-                                new_product = self.env['product.template'].sudo().create(product_vals)
-                                _logger.info(f"Producto creado sin barcode: {new_product.name}")
-                            else:
-                                _logger.error(f"Error al crear producto '{name}': {e}")
+                        new_product = self.env['product.template'].sudo().create(product_vals)
+                        _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
 
                     except Exception as e:
-                        _logger.error(f"Fallo inesperado al procesar producto remoto {product_data.get('name')}: {e}")
+                        _logger.error(f"Error al procesar producto {product_data.get('name')}: {e}")
 
         except Exception as e:
             _logger.error(f"Error general en la migración de productos: {e}")
