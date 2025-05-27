@@ -22,7 +22,7 @@
         'views/migration_views.xml',
         'views/lot_view.xml',
         'views/migration_menu.xml',
-        'views/server_action.xml',
+        'views/server_actions.xml'
     ],
     'demo': [
         'demo/demo.xml',
