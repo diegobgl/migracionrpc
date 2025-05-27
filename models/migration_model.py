@@ -81,44 +81,55 @@ class ProductMigration(models.Model):
             _logger.error(f"Error durante la migración de imágenes: {e}")
 
 
-    def migrate_contacts(self):
+    def migrate_products(self):
+        """
+        Migra productos activos desde una base remota Odoo a la instancia local en lotes.
+        Evita duplicados y sólo consulta datos remotos.
+        """
+        BATCH_SIZE = 100
         uid, models = self.connect_to_odoo()
-        contacts = models.execute_kw(self.db, uid, self.password,
-                                     'res.partner', 'search_read',
-                                     [[]],
-                                     {'fields': ['is_company', 'name', 'street', 'city', 'state_id', 'country_id',
-                                                 'vat', 'function', 'phone', 'email', 'l10n_cl_dte_email']})
-        
-        for contact in contacts:
-            try:
-                # Preparación y mapeo de campos de Odoo 17 a Odoo 15
-                local_contact_vals = {
-                    'is_company': contact['is_company'],
-                    'name': contact['name'],
-                    'street': contact.get('street', ''),
-                    # Asume que tienes campos personalizados en Odoo 15 para los siguientes datos
-                    'document_number': contact.get('vat', ''),
-                    'phone': contact.get('phone', ''),
-                    'email': contact.get('email', ''),
-                    'dte_email': contact.get('l10n_cl_dte_email', ''),
-                    # Añade aquí cualquier otro mapeo de campos necesario
-                }
 
-                # Buscar si existe un contacto con el mismo nombre y número de documento en la base de datos local
-                existing_contact = self.env['res.partner'].search([('name', '=', contact['name']), ('vat', '=', contact.get('vat', ''))], limit=1)
-                
-                if existing_contact:
-                    existing_contact.write(local_contact_vals)
-                    _logger.info(f"Contacto actualizado: {contact['name']}")
-                else:
-                    self.env['res.partner'].create(local_contact_vals)
-                    _logger.info(f"Contacto creado: {contact['name']}")
-                    
-            except Exception as e:
-                _logger.error(f"Error al migrar el contacto {contact['name']}: {e}")
+        try:
+            # Solo productos activos
+            total_products = models.execute_kw(self.db, uid, self.password,
+                                            'product.template', 'search_count', [[('active', '=', True)]])
+            _logger.info('Total de productos activos a migrar: %s', total_products)
 
-        _logger.info("Migración de contactos completada.")
+            for offset in range(0, total_products, BATCH_SIZE):
+                product_batch = models.execute_kw(self.db, uid, self.password,
+                                                'product.template', 'search_read',
+                                                [[('active', '=', True)]],
+                                                {'fields': ['name', 'default_code', 'list_price', 'standard_price', 'active', 'barcode'],
+                                                'limit': BATCH_SIZE,
+                                                'offset': offset})
 
+                for product_data in product_batch:
+                    default_code = product_data.get('default_code')
+                    name = product_data.get('name')
+
+                    # Buscar duplicado local por default_code o name
+                    domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
+                    existing_product = self.env['product.template'].sudo().search(domain, limit=1)
+
+                    if existing_product:
+                        _logger.info(f"Producto ya existe localmente: {existing_product.name}, se omite.")
+                        continue
+
+                    product_vals = {
+                        'name': name,
+                        'default_code': default_code,
+                        'list_price': product_data.get('list_price'),
+                        'standard_price': product_data.get('standard_price'),
+                        'active': product_data.get('active'),
+                        'barcode': product_data.get('barcode'),
+                    }
+
+                    new_product = self.env['product.template'].sudo().create(product_vals)
+                    _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
+
+        except Exception as e:
+            _logger.error(f"Error al migrar productos en lote: {e}")
+            raise UserError(f"Error al migrar productos: {str(e)}")
 
         #@api.multi
 
