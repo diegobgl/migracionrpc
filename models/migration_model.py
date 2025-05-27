@@ -7,7 +7,7 @@ import xmlrpc.client  # Importa el módulo xmlrpc.client
 import json
 import time
 import psycopg2
-
+import logging
 
 
 _logger = logging.getLogger(__name__)
@@ -324,7 +324,9 @@ class ProductMigration(models.Model):
 
         except Exception as e:
             _logger.error(f'Error al descargar lotes de productos: {e}')
-    _logger = logging.getLogger(__name__)
+
+
+_logger = logging.getLogger(__name__)
 
 class ProductDataJSON(models.Model):
     _name = 'product.data.json'
@@ -332,50 +334,46 @@ class ProductDataJSON(models.Model):
     
     data = fields.Text('Datos de producto', required=True)
 
+    @api.model
     def process_stored_product_batches(self):
-        """
-        Procesa lotes JSON guardados en 'product.data.json', migrando productos de a 10 en 10.
-        """
-        product_batches = self.env['product.data.json'].sudo().search([])
-
-        for batch in product_batches:
+        batches = self.search([])
+        for batch in batches:
             try:
+                self.env.cr.commit()  # Fuerza guardar y reiniciar cursor entre lotes
                 products = json.loads(batch.data)
-                barcodes_seen = set()
+                _logger.info(f"Procesando lote de {len(products)} productos")
 
-                # Procesar en sub-lotes de 10 productos
-                for i in range(0, len(products), 10):
-                    sub_products = products[i:i+10]
+                for i, p in enumerate(products):
+                    try:
+                        name = p.get('name')
+                        if not name:
+                            continue
 
-                    for product_data in sub_products:
-                        default_code = product_data.get('default_code')
-                        name = product_data.get('name')
-                        barcode = product_data.get('barcode')
-
-                        domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
+                        domain = [('default_code', '=', p.get('default_code'))] if p.get('default_code') else [('name', '=', name)]
                         if self.env['product.template'].sudo().search(domain, limit=1):
                             continue
 
-                        if barcode:
-                            if barcode in barcodes_seen:
-                                continue
-                            if self.env['product.template'].sudo().search([('barcode', '=', barcode)], limit=1):
-                                continue
-                            barcodes_seen.add(barcode)
+                        if p.get('barcode') and self.env['product.template'].sudo().search([('barcode', '=', p['barcode'])], limit=1):
+                            p['barcode'] = False  # Elimina el duplicado
 
-                        product_vals = {
+                        self.env['product.template'].sudo().create({
                             'name': name,
-                            'default_code': default_code,
-                            'list_price': product_data.get('list_price'),
-                            'standard_price': product_data.get('standard_price'),
-                            'active': product_data.get('active'),
-                            'barcode': barcode,
-                        }
+                            'default_code': p.get('default_code'),
+                            'list_price': p.get('list_price', 0),
+                            'standard_price': p.get('standard_price', 0),
+                            'active': p.get('active', True),
+                            'barcode': p.get('barcode'),
+                        })
 
-                        self.env['product.template'].sudo().create(product_vals)
+                        if (i + 1) % 10 == 0:
+                            self.env.cr.commit()  # Comitea cada 10 para evitar cierre de cursor
 
-                # Eliminar lote una vez procesado completamente
+                    except Exception as e:
+                        _logger.error(f"Error con producto {p.get('name')}: {e}")
+                        self.env.cr.rollback()
+
                 batch.sudo().unlink()
 
             except Exception as e:
-                _logger.error(f"Error al procesar lote de productos: {e}")
+                _logger.error(f"Error al procesar lote: {e}")
+                self.env.cr.rollback()
