@@ -6,6 +6,8 @@ import tempfile
 import xmlrpc.client  # Importa el módulo xmlrpc.client
 import json
 import time
+import psycopg2
+
 
 
 
@@ -84,7 +86,7 @@ class ProductMigration(models.Model):
     def migrate_products(self):
         """
         Migra productos activos desde una base remota Odoo a la instancia local en lotes.
-        Evita duplicados, ignora errores de códigos de barras duplicados y solo consulta datos remotos.
+        Ignora duplicados y errores individuales, especialmente los relacionados con código de barras.
         """
         BATCH_SIZE = 100
         uid, models = self.connect_to_odoo()
@@ -103,43 +105,45 @@ class ProductMigration(models.Model):
                                                 'offset': offset})
 
                 for product_data in product_batch:
-                    default_code = product_data.get('default_code')
-                    name = product_data.get('name')
-
-                    # Evitar duplicados locales
-                    domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
-                    existing_product = self.env['product.template'].sudo().search(domain, limit=1)
-
-                    if existing_product:
-                        _logger.info(f"Producto ya existe localmente: {existing_product.name}, se omite.")
-                        continue
-
-                    product_vals = {
-                        'name': name,
-                        'default_code': default_code,
-                        'list_price': product_data.get('list_price'),
-                        'standard_price': product_data.get('standard_price'),
-                        'active': product_data.get('active'),
-                        'barcode': product_data.get('barcode'),
-                    }
-
                     try:
-                        new_product = self.env['product.template'].sudo().create(product_vals)
-                        _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
-                    except Exception as e:
-                        # Intenta nuevamente sin barcode si falla
-                        _logger.warning(f"Error al crear producto '{name}' con barcode '{product_vals.get('barcode')}': {e}")
-                        product_vals['barcode'] = False
+                        default_code = product_data.get('default_code')
+                        name = product_data.get('name')
+
+                        # Evitar duplicados locales
+                        domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
+                        existing_product = self.env['product.template'].sudo().search(domain, limit=1)
+
+                        if existing_product:
+                            _logger.info(f"Producto ya existe localmente: {existing_product.name}, se omite.")
+                            continue
+
+                        product_vals = {
+                            'name': name,
+                            'default_code': default_code,
+                            'list_price': product_data.get('list_price'),
+                            'standard_price': product_data.get('standard_price'),
+                            'active': product_data.get('active'),
+                            'barcode': product_data.get('barcode'),
+                        }
+
                         try:
                             new_product = self.env['product.template'].sudo().create(product_vals)
-                            _logger.info(f"Producto creado sin barcode: {new_product.name}")
-                        except Exception as e2:
-                            _logger.error(f"No se pudo crear el producto '{name}' ni siquiera sin barcode: {e2}")
+                            _logger.info(f"Producto creado: {new_product.name} con ID: {new_product.id}")
+                        except Exception as e:
+                            if 'barcode' in str(e) and 'already exists' in str(e):
+                                _logger.warning(f"Código de barras duplicado para {name}, reintentando sin barcode.")
+                                product_vals['barcode'] = False
+                                new_product = self.env['product.template'].sudo().create(product_vals)
+                                _logger.info(f"Producto creado sin barcode: {new_product.name}")
+                            else:
+                                _logger.error(f"Error al crear producto '{name}': {e}")
+
+                    except Exception as e:
+                        _logger.error(f"Fallo inesperado al procesar producto remoto {product_data.get('name')}: {e}")
 
         except Exception as e:
             _logger.error(f"Error general en la migración de productos: {e}")
             raise UserError(f"Error general en la migración: {str(e)}")
-
 
 
 
