@@ -334,8 +334,7 @@ class ProductDataJSON(models.Model):
 
     def process_stored_product_batches(self):
         """
-        Procesa los lotes de productos almacenados en formato JSON.
-        Crea productos en la base local evitando duplicados por default_code y barcode.
+        Procesa lotes JSON guardados en 'product.data.json', migrando productos de a 10 en 10.
         """
         product_batches = self.env['product.data.json'].sudo().search([])
 
@@ -344,35 +343,39 @@ class ProductDataJSON(models.Model):
                 products = json.loads(batch.data)
                 barcodes_seen = set()
 
-                for product_data in products:
-                    default_code = product_data.get('default_code')
-                    name = product_data.get('name')
-                    barcode = product_data.get('barcode')
+                # Procesar en sub-lotes de 10 productos
+                for i in range(0, len(products), 10):
+                    sub_products = products[i:i+10]
 
-                    domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
-                    if self.env['product.template'].sudo().search(domain, limit=1):
-                        continue
+                    for product_data in sub_products:
+                        default_code = product_data.get('default_code')
+                        name = product_data.get('name')
+                        barcode = product_data.get('barcode')
 
-                    if barcode:
-                        if barcode in barcodes_seen:
+                        domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
+                        if self.env['product.template'].sudo().search(domain, limit=1):
                             continue
-                        if self.env['product.template'].sudo().search([('barcode', '=', barcode)], limit=1):
-                            continue
-                        barcodes_seen.add(barcode)
 
-                    product_vals = {
-                        'name': name,
-                        'default_code': default_code,
-                        'list_price': product_data.get('list_price'),
-                        'standard_price': product_data.get('standard_price'),
-                        'active': product_data.get('active'),
-                        'barcode': barcode,
-                    }
+                        if barcode:
+                            if barcode in barcodes_seen:
+                                continue
+                            if self.env['product.template'].sudo().search([('barcode', '=', barcode)], limit=1):
+                                continue
+                            barcodes_seen.add(barcode)
 
-                    self.env['product.template'].sudo().create(product_vals)
+                        product_vals = {
+                            'name': name,
+                            'default_code': default_code,
+                            'list_price': product_data.get('list_price'),
+                            'standard_price': product_data.get('standard_price'),
+                            'active': product_data.get('active'),
+                            'barcode': barcode,
+                        }
 
-                # Borrar lote procesado
+                        self.env['product.template'].sudo().create(product_vals)
+
+                # Eliminar lote una vez procesado completamente
                 batch.sudo().unlink()
 
             except Exception as e:
-                _logger.error(f"Error al procesar lote JSON: {e}")
+                _logger.error(f"Error al procesar lote de productos: {e}")
