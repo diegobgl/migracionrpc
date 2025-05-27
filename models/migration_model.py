@@ -82,7 +82,6 @@ class ProductMigration(models.Model):
         except Exception as e:
             _logger.error(f"Error durante la migración de imágenes: {e}")
 
-
     def migrate_products(self):
         """
         Migra productos activos desde Odoo 12 (remoto) a Odoo 16 (local).
