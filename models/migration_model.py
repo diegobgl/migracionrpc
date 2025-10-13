@@ -293,32 +293,34 @@ class ProductMigration(models.Model):
     # =========================
     def migrate_product_images(self, force=False):
         """
-        Migra imágenes desde Odoo remoto (18) a local:
-        - Considera image_1920 y image_variant_1920.
-        - Mapea producto por external_id/default_code/barcode/name.
-        - Sobrescribe si 'force=True' o si el checksum difiere.
-        - Convierte WebP a JPEG optimizado.
+        Migra imágenes desde Odoo remoto (18) a local, asegurando que:
+        - Se escribe SIEMPRE image_1920 en local (las demás se recalculan).
+        - Se selecciona el mejor tamaño disponible en remoto (plantilla o variante).
+        - Se convierte WebP -> JPEG cuando aplica.
+        - 'force=True' sobrescribe aunque exista imagen local.
         """
         uid, models = self.connect_to_odoo()
 
-        # Traemos IDs de productos que tengan al menos alguna de las imágenes set
-        # (si tu origen no permite dominio OR en binarios, haremos sobre todo por lotes completos)
+        # Trae todos los productos activos (filtraremos por los que tengan alguna imagen)
         try:
             remote_ids = self.execute_kw_with_retry(
                 models, self.db, uid, self.password,
                 'product.template', 'search',
-                [[('active', '=', True)]],  # dominio amplio; filtramos luego por tener imagen
+                [[('active', '=', True)]],
             )
         except Exception as e:
             _logger.error(f"No se pudieron obtener IDs remotos: {e}")
             return
 
-        _logger.info(f"Productos remotos a revisar para imágenes: {len(remote_ids)}")
+        _logger.info(f"Productos remotos a revisar: {len(remote_ids)}")
 
         BATCH = 50
         fields_to_read = [
             'id', 'name', 'external_id', 'default_code', 'barcode',
-            'image_1920', 'image_variant_1920'
+            # tamaños de plantilla
+            'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
+            # tamaños de variante
+            'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
         ]
 
         for i in range(0, len(remote_ids), BATCH):
@@ -335,35 +337,30 @@ class ProductMigration(models.Model):
 
             for p in products:
                 try:
-                    img_b64 = self._first_nonempty_image(p)
+                    # escoger mejor imagen disponible en remoto
+                    img_b64 = self._best_remote_image(p)
                     if not img_b64:
-                        # No hay imagen ni en plantilla ni en variante
-                        continue
+                        continue  # remoto sin imagen en ningún tamaño
 
                     local_prod = self._find_local_product(p)
-                    if not local_prod:
-                        _logger.warning(f"No se encontró producto local para remoto ID {p.get('id')} ({p.get('name')}).")
+                    if not local_prod or not local_prod.id:
+                        _logger.warning(f"Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
                         continue
 
-                    # Si no hay local (recordset vacío), saltamos
-                    if not local_prod.id:
-                        _logger.warning(f"Sin match local para '{p.get('name')}' (id remoto {p.get('id')}).")
-                        continue
-
-                    # Si ya tiene imagen y no hay force, compara checksum
+                    # si ya tiene una imagen y no forzamos, no reescribimos
                     if local_prod.image_1920 and not force:
-                        remote_hash = self._b64_sha1(img_b64)
-                        local_hash = self._b64_sha1(local_prod.image_1920)
-                        if remote_hash == local_hash:
-                            # Idéntica: nada que hacer
-                            continue
+                        continue
 
-                    # Convertir/optimizar (WebP -> JPEG)
+                    # convertir/optimizar por si viene en WebP
                     optimized_b64 = self.convertir_y_optimizar_imagen(img_b64)
 
-                    # Escribir
-                    local_prod.write({'image_1920': optimized_b64})
-                    _logger.info(f"Imagen actualizada para '{local_prod.display_name}' (force={force}).")
+                    # Para forzar recálculo de miniaturas, limpiamos la de 128 si existiese
+                    vals = {
+                        'image_128': False,
+                        'image_1920': optimized_b64,
+                    }
+                    local_prod.write(vals)
+                    _logger.info(f"Imagen (1920) establecida para '{local_prod.display_name}' (force={force}).")
 
                 except Exception as e:
                     _logger.error(f"Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
@@ -434,13 +431,34 @@ class ProductMigration(models.Model):
         img = product_data.get('image_1920') or product_data.get('image_variant_1920')
         return img
 
+    def _pick_best_image(self, data, fields_prefix='image_'):
+        """
+        Devuelve el mejor base64 disponible en orden:
+        1920 > 1024 > 512 > 256 > 128
+        data: dict de campos leídos vía XML-RPC.
+        fields_prefix: 'image_' o 'image_variant_'.
+        """
+        for size in ('1920', '1024', '512', '256', '128'):
+            key = f'{fields_prefix}{size}'
+            val = data.get(key)
+            if val:
+                return val
+        return None
+
+    def _best_remote_image(self, p):
+        """
+        Busca primero en plantilla (image_*) y si no, en variante (image_variant_*).
+        Escoge el mejor tamaño disponible.
+        """
+        img = self._pick_best_image(p, 'image_')
+        if not img:
+            img = self._pick_best_image(p, 'image_variant_')
+        return img
+
+
     def _find_local_product(self, product_data):
         """
-        Intenta mapear el producto local usando, en orden:
-        - external_id (si ambos lo tienen)
-        - default_code
-        - barcode
-        - name
+        Mapear producto local por: external_id > default_code > barcode > name.
         """
         PT = self.env['product.template'].sudo()
 
@@ -468,7 +486,8 @@ class ProductMigration(models.Model):
             if rec:
                 return rec
 
-        return self.env['product.template']  # recordset vacío
+        return self.env['product.template']  # vacío
+
 
 class ProductDataJSON(models.Model):
     _name = 'product.data.json'
