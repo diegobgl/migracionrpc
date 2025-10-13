@@ -291,55 +291,82 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE IMÁGENES (1920) CON CONVERSIÓN
     # =========================
-    def migrate_product_images(self):
+    def migrate_product_images(self, force=False):
         """
-        Migra imágenes de productos desde remoto a local:
-        - Procesamiento por lotes
-        - Conversión WebP -> JPEG optimizado
-        - Manejo de errores y logs
+        Migra imágenes desde Odoo remoto (18) a local:
+        - Considera image_1920 y image_variant_1920.
+        - Mapea producto por external_id/default_code/barcode/name.
+        - Sobrescribe si 'force=True' o si el checksum difiere.
+        - Convierte WebP a JPEG optimizado.
         """
-        tamanio_lote = 100
-
         uid, models = self.connect_to_odoo()
-        product_ids = models.execute_kw(
-            self.db, uid, self.password,
-            'product.template', 'search', [[('external_id', '!=', False)]]
-        )
-        _logger.info(f"Total de productos con imágenes para migrar: {len(product_ids)}")
 
-        for i in range(0, len(product_ids), tamanio_lote):
-            batch_ids = product_ids[i:i + tamanio_lote]
-            products_data = models.execute_kw(
-                self.db, uid, self.password,
-                'product.template', 'read', [batch_ids, ['external_id', 'image_1920']]
+        # Traemos IDs de productos que tengan al menos alguna de las imágenes set
+        # (si tu origen no permite dominio OR en binarios, haremos sobre todo por lotes completos)
+        try:
+            remote_ids = self.execute_kw_with_retry(
+                models, self.db, uid, self.password,
+                'product.template', 'search',
+                [[('active', '=', True)]],  # dominio amplio; filtramos luego por tener imagen
             )
+        except Exception as e:
+            _logger.error(f"No se pudieron obtener IDs remotos: {e}")
+            return
 
-            for product_data in products_data:
+        _logger.info(f"Productos remotos a revisar para imágenes: {len(remote_ids)}")
+
+        BATCH = 50
+        fields_to_read = [
+            'id', 'name', 'external_id', 'default_code', 'barcode',
+            'image_1920', 'image_variant_1920'
+        ]
+
+        for i in range(0, len(remote_ids), BATCH):
+            batch_ids = remote_ids[i:i + BATCH]
+            try:
+                products = self.execute_kw_with_retry(
+                    models, self.db, uid, self.password,
+                    'product.template', 'read',
+                    [batch_ids, fields_to_read],
+                )
+            except Exception as e:
+                _logger.error(f"Fallo leyendo batch {i}-{i+BATCH}: {e}")
+                continue
+
+            for p in products:
                 try:
-                    producto_external_id = product_data.get('external_id')
-                    if not producto_external_id:
-                        _logger.warning(f"El producto con ID {product_data.get('id')} no tiene un ID externo.")
+                    img_b64 = self._first_nonempty_image(p)
+                    if not img_b64:
+                        # No hay imagen ni en plantilla ni en variante
                         continue
 
-                    producto_local = self.env['product.template'].search([('external_id', '=', producto_external_id)], limit=1)
+                    local_prod = self._find_local_product(p)
+                    if not local_prod:
+                        _logger.warning(f"No se encontró producto local para remoto ID {p.get('id')} ({p.get('name')}).")
+                        continue
 
-                    if producto_local and not producto_local.image_1920:
-                        try:
-                            datos_imagen = product_data.get('image_1920')
-                            if not datos_imagen:
-                                _logger.warning(f"El producto '{producto_local.name}' no tiene datos de imagen.")
-                                continue
+                    # Si no hay local (recordset vacío), saltamos
+                    if not local_prod.id:
+                        _logger.warning(f"Sin match local para '{p.get('name')}' (id remoto {p.get('id')}).")
+                        continue
 
-                            datos_imagen = self.convertir_y_optimizar_imagen(datos_imagen)
-                            producto_local.write({'image_1920': datos_imagen})
-                            _logger.info(f"Imagen migrada para '{producto_local.name}'.")
-                        except Exception as e:
-                            _logger.error(f"Error al migrar la imagen para '{producto_local.name}': {e}")
+                    # Si ya tiene imagen y no hay force, compara checksum
+                    if local_prod.image_1920 and not force:
+                        remote_hash = self._b64_sha1(img_b64)
+                        local_hash = self._b64_sha1(local_prod.image_1920)
+                        if remote_hash == local_hash:
+                            # Idéntica: nada que hacer
+                            continue
+
+                    # Convertir/optimizar (WebP -> JPEG)
+                    optimized_b64 = self.convertir_y_optimizar_imagen(img_b64)
+
+                    # Escribir
+                    local_prod.write({'image_1920': optimized_b64})
+                    _logger.info(f"Imagen actualizada para '{local_prod.display_name}' (force={force}).")
 
                 except Exception as e:
-                    _logger.error(f"Error al obtener el ID externo del producto: {e}")
-
-        _logger.info("Migración de imágenes de productos completada.")
+                    _logger.error(f"Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
         """
@@ -390,6 +417,58 @@ class ProductMigration(models.Model):
                 return base64.b64encode(datos_imagen).decode('utf-8')
             return datos_imagen
 
+    def _b64_sha1(self, b64str):
+        import hashlib, base64
+        if not b64str:
+            return None
+        if isinstance(b64str, str):
+            raw = base64.b64decode(b64str)
+        else:
+            raw = b64str
+        return hashlib.sha1(raw).hexdigest()
+
+    def _first_nonempty_image(self, product_data):
+        """
+        Prioriza image_1920 (plantilla) y usa image_variant_1920 si la de plantilla está vacía.
+        """
+        img = product_data.get('image_1920') or product_data.get('image_variant_1920')
+        return img
+
+    def _find_local_product(self, product_data):
+        """
+        Intenta mapear el producto local usando, en orden:
+        - external_id (si ambos lo tienen)
+        - default_code
+        - barcode
+        - name
+        """
+        PT = self.env['product.template'].sudo()
+
+        ext_id = product_data.get('external_id')
+        if ext_id:
+            rec = PT.search([('external_id', '=', ext_id)], limit=1)
+            if rec:
+                return rec
+
+        default_code = product_data.get('default_code')
+        if default_code:
+            rec = PT.search([('default_code', '=', default_code)], limit=1)
+            if rec:
+                return rec
+
+        barcode = product_data.get('barcode')
+        if barcode:
+            rec = PT.search([('barcode', '=', barcode)], limit=1)
+            if rec:
+                return rec
+
+        name = product_data.get('name')
+        if name:
+            rec = PT.search([('name', '=', name)], limit=1)
+            if rec:
+                return rec
+
+        return self.env['product.template']  # recordset vacío
 
 class ProductDataJSON(models.Model):
     _name = 'product.data.json'
