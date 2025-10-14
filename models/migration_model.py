@@ -293,38 +293,42 @@ class ProductMigration(models.Model):
     # =========================
     def migrate_product_images(self, force=False, prefer_variant=False):
         """
-        Copia las imágenes EXACTAS desde Odoo remoto a local (sin conversiones).
-        - Toma image_1920 directamente del remoto y la asigna a image_1920 local.
-        - Si prefer_variant=True y la variante tiene imagen, usa image_variant_1920 primero.
-        - No recomprime, no convierte; pasa el base64 tal cual.
-        - Si force=False y ya hay imagen local igual, no reescribe.
-
-        Params:
-            force(bool): sobrescribir aunque ya tenga imagen local.
-            prefer_variant(bool): prioriza image_variant_1920 sobre image_1920 de plantilla.
+        Copia la imagen EXACTA desde Odoo 18 a local escribiendo image_1920.
+        - No convierte ni recomprime; pasa el base64 tal cual.
+        - prefer_variant=True prioriza image_variant_1920.
+        - Limpia miniaturas para forzar recálculo.
+        - Si force=False y la imagen es idéntica, no reescribe.
         """
         uid, models = self.connect_to_odoo()
 
-        # 1) Traer todos los productos activos (filtramos luego por los que sí tengan imagen)
         try:
             remote_ids = self.execute_kw_with_retry(
                 models, self.db, uid, self.password,
-                'product.template', 'search',
-                [[('active', '=', True)]],
+                'product.template', 'search', [[('active', '=', True)]],
             )
         except Exception as e:
-            _logger.error(f"No se pudieron obtener IDs remotos: {e}")
+            _logger.error(f"[IMG] No se pudieron obtener IDs remotos: {e}")
             return
 
-        _logger.info(f"[IMÁGENES EXACTAS] Productos remotos a revisar: {len(remote_ids)}")
+        _logger.info(f"[IMG] Productos remotos a revisar: {len(remote_ids)}")
 
         BATCH = 50
-        fields_to_read = [
-            'id', 'name', 'external_id', 'default_code', 'barcode',
-            'image_1920', 'image_variant_1920',
-        ]
 
-        # Pequeño helper local para comparar hashes sin tocar PIL
+        # Construimos la lista de campos de forma segura según lo que exista en el remoto
+        base_candidates = [
+            'id', 'name', 'default_code', 'barcode',
+            'image_1920', 'image_variant_1920',
+            'image_1024', 'image_512', 'image_256', 'image_128',
+            'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
+            # si tu remoto tiene un x_external_id personalizado, lo pedimos también
+            'x_external_id',
+        ]
+        fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', base_candidates)
+        if 'id' not in fields_to_read:
+            fields_to_read.insert(0, 'id')
+        if 'name' not in fields_to_read:
+            fields_to_read.insert(1, 'name')
+
         import hashlib, base64
         def _sha1_b64(b64str):
             if not b64str:
@@ -332,59 +336,64 @@ class ProductMigration(models.Model):
             try:
                 raw = base64.b64decode(b64str)
             except Exception:
-                # si ya viniera bytes o algo raro, lo tratamos directo
                 raw = b64str if isinstance(b64str, (bytes, bytearray)) else bytes(str(b64str), 'utf-8')
             return hashlib.sha1(raw).hexdigest()
 
+        def _pick_exact(p):
+            # prioriza plantilla o variante según prefer_variant
+            primary = 'image_variant_1920' if prefer_variant and 'image_variant_1920' in p else 'image_1920'
+            fallback = 'image_1920' if primary == 'image_variant_1920' else 'image_variant_1920'
+            img = p.get(primary) or p.get(fallback)
+            if img:
+                return img
+            # si no hay 1920 en ninguno, usa el mejor tamaño disponible tal cual
+            for k in (('image_1024','image_variant_1024'),
+                    ('image_512','image_variant_512'),
+                    ('image_256','image_variant_256'),
+                    ('image_128','image_variant_128')):
+                img = p.get(k[0]) or p.get(k[1])
+                if img:
+                    return img
+            return None
+
         for i in range(0, len(remote_ids), BATCH):
-            batch_ids = remote_ids[i:i + BATCH]
+            batch_ids = remote_ids[i:i+BATCH]
             try:
                 products = self.execute_kw_with_retry(
                     models, self.db, uid, self.password,
-                    'product.template', 'read',
-                    [batch_ids, fields_to_read],
+                    'product.template', 'read', [batch_ids, fields_to_read],
                 )
             except Exception as e:
-                _logger.error(f"Fallo leyendo batch {i}-{i+BATCH}: {e}")
+                _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+BATCH}: {e}")
                 continue
 
             for p in products:
                 try:
-                    # 2) Elegir fuente exacta según prefer_variant
-                    img_b64 = None
-                    if prefer_variant:
-                        img_b64 = p.get('image_variant_1920') or p.get('image_1920')
-                    else:
-                        img_b64 = p.get('image_1920') or p.get('image_variant_1920')
-
+                    img_b64 = _pick_exact(p)
                     if not img_b64:
-                        # No hay imagen en el remoto
                         continue
 
-                    # 3) Buscar el producto local
                     local_prod = self._find_local_product(p)
                     if not local_prod or not local_prod.id:
-                        _logger.warning(f"[IMÁGENES EXACTAS] Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
+                        _logger.warning(f"[IMG] Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
                         continue
 
-                    # 4) Si ya tiene imagen y no forzamos, comparamos hash para evitar trabajo
                     if local_prod.image_1920 and not force:
                         if _sha1_b64(local_prod.image_1920) == _sha1_b64(img_b64):
-                            continue  # es exactamente la misma imagen
+                            continue  # ya es la misma
 
-                    # 5) Escribir TAL CUAL en image_1920; limpiamos miniaturas para que se recalculen
                     vals = {
                         'image_128': False,
                         'image_256': False,
                         'image_512': False,
                         'image_1024': False,
-                        'image_1920': img_b64,  # exacto
+                        'image_1920': img_b64,  # exacto desde remoto
                     }
                     local_prod.sudo().write(vals)
-                    _logger.info(f"[IMÁGENES EXACTAS] Imagen copiada en '{local_prod.display_name}' (force={force}, prefer_variant={prefer_variant}).")
+                    _logger.info(f"[IMG] image_1920 copiada en '{local_prod.display_name}' (force={force}, prefer_variant={prefer_variant}).")
 
                 except Exception as e:
-                    _logger.error(f"[IMÁGENES EXACTAS] Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
+                    _logger.error(f"[IMG] Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
         """
@@ -477,30 +486,40 @@ class ProductMigration(models.Model):
         return img
 
 
+# === Mapeo local: ya no depende de 'external_id'; si tienes x_external_id lo usa si existe ===
     def _find_local_product(self, product_data):
         """
-        Mapear producto local por: external_id > default_code > barcode > name.
+        Mapea producto local por, en orden:
+        - x_external_id (si existe el campo en local y viene en product_data)
+        - default_code
+        - barcode
+        - name
         """
         PT = self.env['product.template'].sudo()
 
-        ext_id = product_data.get('external_id')
-        if ext_id:
-            rec = PT.search([('external_id', '=', ext_id)], limit=1)
-            if rec:
-                return rec
+        # 1) x_external_id opcional (custom)
+        if self._local_field_exists('product.template', 'x_external_id'):
+            xext = product_data.get('x_external_id')  # solo existirá si lo pedimos al remoto
+            if xext:
+                rec = PT.search([('x_external_id', '=', xext)], limit=1)
+                if rec:
+                    return rec
 
+        # 2) default_code
         default_code = product_data.get('default_code')
         if default_code:
             rec = PT.search([('default_code', '=', default_code)], limit=1)
             if rec:
                 return rec
 
+        # 3) barcode
         barcode = product_data.get('barcode')
         if barcode:
             rec = PT.search([('barcode', '=', barcode)], limit=1)
             if rec:
                 return rec
 
+        # 4) name
         name = product_data.get('name')
         if name:
             rec = PT.search([('name', '=', name)], limit=1)
@@ -509,6 +528,33 @@ class ProductMigration(models.Model):
 
         return self.env['product.template']  # vacío
 
+
+    def _remote_field_exists(self, models, db, uid, password, model_name, field_name):
+        """Devuelve True si el campo existe en el modelo remoto."""
+        try:
+            fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
+            return field_name in fields
+        except Exception:
+            return False
+
+    def _remote_fields(self, models, db, uid, password, model_name, candidates):
+        """Filtra y devuelve solo los campos existentes en el remoto."""
+        existing = []
+        try:
+            fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
+            for c in candidates:
+                if c in fields:
+                    existing.append(c)
+        except Exception:
+            # Si falla fields_get por alguna restricción, caemos a leer mínimos seguros
+            pass
+        return existing
+
+    def _local_field_exists(self, model_name, field_name):
+        """True si el campo existe en el modelo local (por ejemplo, x_external_id)."""
+        return bool(self.env['ir.model.fields'].sudo().search([
+            ('model', '=', model_name), ('name', '=', field_name)
+        ], limit=1))
 
 class ProductDataJSON(models.Model):
     _name = 'product.data.json'
