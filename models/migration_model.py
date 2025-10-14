@@ -291,17 +291,21 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE IMÁGENES (1920) CON CONVERSIÓN
     # =========================
-    def migrate_product_images(self, force=False):
+    def migrate_product_images(self, force=False, prefer_variant=False):
         """
-        Migra imágenes desde Odoo remoto (18) a local, asegurando que:
-        - Se escribe SIEMPRE image_1920 en local (las demás se recalculan).
-        - Se selecciona el mejor tamaño disponible en remoto (plantilla o variante).
-        - Se convierte WebP -> JPEG cuando aplica.
-        - 'force=True' sobrescribe aunque exista imagen local.
+        Copia las imágenes EXACTAS desde Odoo remoto a local (sin conversiones).
+        - Toma image_1920 directamente del remoto y la asigna a image_1920 local.
+        - Si prefer_variant=True y la variante tiene imagen, usa image_variant_1920 primero.
+        - No recomprime, no convierte; pasa el base64 tal cual.
+        - Si force=False y ya hay imagen local igual, no reescribe.
+
+        Params:
+            force(bool): sobrescribir aunque ya tenga imagen local.
+            prefer_variant(bool): prioriza image_variant_1920 sobre image_1920 de plantilla.
         """
         uid, models = self.connect_to_odoo()
 
-        # Trae todos los productos activos (filtraremos por los que tengan alguna imagen)
+        # 1) Traer todos los productos activos (filtramos luego por los que sí tengan imagen)
         try:
             remote_ids = self.execute_kw_with_retry(
                 models, self.db, uid, self.password,
@@ -312,16 +316,25 @@ class ProductMigration(models.Model):
             _logger.error(f"No se pudieron obtener IDs remotos: {e}")
             return
 
-        _logger.info(f"Productos remotos a revisar: {len(remote_ids)}")
+        _logger.info(f"[IMÁGENES EXACTAS] Productos remotos a revisar: {len(remote_ids)}")
 
         BATCH = 50
         fields_to_read = [
             'id', 'name', 'external_id', 'default_code', 'barcode',
-            # tamaños de plantilla
-            'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
-            # tamaños de variante
-            'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
+            'image_1920', 'image_variant_1920',
         ]
+
+        # Pequeño helper local para comparar hashes sin tocar PIL
+        import hashlib, base64
+        def _sha1_b64(b64str):
+            if not b64str:
+                return None
+            try:
+                raw = base64.b64decode(b64str)
+            except Exception:
+                # si ya viniera bytes o algo raro, lo tratamos directo
+                raw = b64str if isinstance(b64str, (bytes, bytearray)) else bytes(str(b64str), 'utf-8')
+            return hashlib.sha1(raw).hexdigest()
 
         for i in range(0, len(remote_ids), BATCH):
             batch_ids = remote_ids[i:i + BATCH]
@@ -337,33 +350,41 @@ class ProductMigration(models.Model):
 
             for p in products:
                 try:
-                    # escoger mejor imagen disponible en remoto
-                    img_b64 = self._best_remote_image(p)
-                    if not img_b64:
-                        continue  # remoto sin imagen en ningún tamaño
+                    # 2) Elegir fuente exacta según prefer_variant
+                    img_b64 = None
+                    if prefer_variant:
+                        img_b64 = p.get('image_variant_1920') or p.get('image_1920')
+                    else:
+                        img_b64 = p.get('image_1920') or p.get('image_variant_1920')
 
+                    if not img_b64:
+                        # No hay imagen en el remoto
+                        continue
+
+                    # 3) Buscar el producto local
                     local_prod = self._find_local_product(p)
                     if not local_prod or not local_prod.id:
-                        _logger.warning(f"Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
+                        _logger.warning(f"[IMÁGENES EXACTAS] Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
                         continue
 
-                    # si ya tiene una imagen y no forzamos, no reescribimos
+                    # 4) Si ya tiene imagen y no forzamos, comparamos hash para evitar trabajo
                     if local_prod.image_1920 and not force:
-                        continue
+                        if _sha1_b64(local_prod.image_1920) == _sha1_b64(img_b64):
+                            continue  # es exactamente la misma imagen
 
-                    # convertir/optimizar por si viene en WebP
-                    optimized_b64 = self.convertir_y_optimizar_imagen(img_b64)
-
-                    # Para forzar recálculo de miniaturas, limpiamos la de 128 si existiese
+                    # 5) Escribir TAL CUAL en image_1920; limpiamos miniaturas para que se recalculen
                     vals = {
                         'image_128': False,
-                        'image_1920': optimized_b64,
+                        'image_256': False,
+                        'image_512': False,
+                        'image_1024': False,
+                        'image_1920': img_b64,  # exacto
                     }
-                    local_prod.write(vals)
-                    _logger.info(f"Imagen (1920) establecida para '{local_prod.display_name}' (force={force}).")
+                    local_prod.sudo().write(vals)
+                    _logger.info(f"[IMÁGENES EXACTAS] Imagen copiada en '{local_prod.display_name}' (force={force}, prefer_variant={prefer_variant}).")
 
                 except Exception as e:
-                    _logger.error(f"Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
+                    _logger.error(f"[IMÁGENES EXACTAS] Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
         """
