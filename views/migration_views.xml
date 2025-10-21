@@ -15,6 +15,11 @@
                         <button string="sincronizar contactos   " type="object" name="migrate_contacts" class="btn-primary"/>
                         <button string="migrar Productos   " type="object" name="migrate_products" class="btn-primary"/>
                         <button string="descargar Productos   " type="object" name="download_product_batches" class="btn-primary"/>
+                        <button name="migrate_stock_onhand"
+                            type="object"
+                            string="Migrar Stock On-Hand (Remoto → Local)"
+                            class="btn-secondary"
+                            context="{'set_mode': True}"/>
                     </group>
                 </sheet>
             </form>
