@@ -487,69 +487,69 @@ class ProductMigration(models.Model):
 
 # === STOCK: helpers de mapeo ===
 
-def _find_local_product_for_stock(self, p_tuple):
-    """
-    p_tuple viene de XML-RPC con formato (id, display_name) para product_id,
-    pero nosotros además necesitamos default_code/barcode/name -> los pedimos aparte cuando haga falta.
-    Aquí retornamos product.product (no template), priorizando:
-    - default_code (en product.product)
-    - barcode (en product.product)
-    - name (en product.template)
-    NOTA: si en tu base los códigos están en template, ajusta el search.
-    """
-    PP = self.env['product.product'].sudo()
-    PT = self.env['product.template'].sudo()
+    def _find_local_product_for_stock(self, p_tuple):
+        """
+        p_tuple viene de XML-RPC con formato (id, display_name) para product_id,
+        pero nosotros además necesitamos default_code/barcode/name -> los pedimos aparte cuando haga falta.
+        Aquí retornamos product.product (no template), priorizando:
+        - default_code (en product.product)
+        - barcode (en product.product)
+        - name (en product.template)
+        NOTA: si en tu base los códigos están en template, ajusta el search.
+        """
+        PP = self.env['product.product'].sudo()
+        PT = self.env['product.template'].sudo()
 
-    # Si tienes variantes 1:1, el name del template ayuda como último recurso.
-    # Mejor: traeremos default_code/barcode por una cache adicional abajo.
-    # Aquí dejamos un método neutro por name.
-    name = p_tuple[1] if isinstance(p_tuple, (list, tuple)) and len(p_tuple) >= 2 else False
-    if name:
-        # intentamos por template name si variante única
-        tmpl = PT.search([('name', '=', name)], limit=1)
-        if tmpl and tmpl.product_variant_id:
-            return tmpl.product_variant_id
-    return PP.browse()  # vacío
-
-
-def _remote_fields(self, models, db, uid, password, model_name, candidates):
-    """Devuelve solo los campos existentes en remoto."""
-    try:
-        fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
-        return [c for c in candidates if c in fields]
-    except Exception:
-        return []
+        # Si tienes variantes 1:1, el name del template ayuda como último recurso.
+        # Mejor: traeremos default_code/barcode por una cache adicional abajo.
+        # Aquí dejamos un método neutro por name.
+        name = p_tuple[1] if isinstance(p_tuple, (list, tuple)) and len(p_tuple) >= 2 else False
+        if name:
+            # intentamos por template name si variante única
+            tmpl = PT.search([('name', '=', name)], limit=1)
+            if tmpl and tmpl.product_variant_id:
+                return tmpl.product_variant_id
+        return PP.browse()  # vacío
 
 
-def _get_remote_internal_locations(self, models, db, uid, password):
-    """Obtiene ubicaciones internas del remoto: id, complete_name, name."""
-    loc_fields = self._remote_fields(models, db, uid, password, 'stock.location', ['id', 'complete_name', 'name', 'usage'])
-    if not loc_fields:
-        loc_fields = ['id', 'complete_name', 'name', 'usage']
-    internal_ids = models.execute_kw(db, uid, password, 'stock.location', 'search', [[('usage', '=', 'internal')]])
-    locs = models.execute_kw(db, uid, password, 'stock.location', 'read', [internal_ids, loc_fields])
-    # Mapa por id remoto
-    return {l['id']: l for l in locs}
+    def _remote_fields(self, models, db, uid, password, model_name, candidates):
+        """Devuelve solo los campos existentes en remoto."""
+        try:
+            fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
+            return [c for c in candidates if c in fields]
+        except Exception:
+            return []
 
 
-def _map_remote_location_to_local(self, remote_loc, by_complete_name=True):
-    """
-    Intenta encontrar la ubicación local equivalente:
-      - por complete_name (recomendado) o por name.
-    Si no existe, retorna el WH/Stock por defecto como último recurso.
-    """
-    SL = self.env['stock.location'].sudo()
-    loc = False
-    if by_complete_name and remote_loc.get('complete_name'):
-        loc = SL.search([('complete_name', '=', remote_loc['complete_name'])], limit=1)
-    if not loc and remote_loc.get('name'):
-        loc = SL.search([('name', '=', remote_loc['name']), ('usage', '=', 'internal')], limit=1)
-    if loc:
-        return loc
+    def _get_remote_internal_locations(self, models, db, uid, password):
+        """Obtiene ubicaciones internas del remoto: id, complete_name, name."""
+        loc_fields = self._remote_fields(models, db, uid, password, 'stock.location', ['id', 'complete_name', 'name', 'usage'])
+        if not loc_fields:
+            loc_fields = ['id', 'complete_name', 'name', 'usage']
+        internal_ids = models.execute_kw(db, uid, password, 'stock.location', 'search', [[('usage', '=', 'internal')]])
+        locs = models.execute_kw(db, uid, password, 'stock.location', 'read', [internal_ids, loc_fields])
+        # Mapa por id remoto
+        return {l['id']: l for l in locs}
 
-    # fallback: Stock del almacén principal
-    wh = self.env['stock.warehouse'].sudo().search([], limit=1)
-    return wh.lot_stock_id if wh else SL.search([('usage', '=', 'internal')], limit=1)
+
+    def _map_remote_location_to_local(self, remote_loc, by_complete_name=True):
+        """
+        Intenta encontrar la ubicación local equivalente:
+        - por complete_name (recomendado) o por name.
+        Si no existe, retorna el WH/Stock por defecto como último recurso.
+        """
+        SL = self.env['stock.location'].sudo()
+        loc = False
+        if by_complete_name and remote_loc.get('complete_name'):
+            loc = SL.search([('complete_name', '=', remote_loc['complete_name'])], limit=1)
+        if not loc and remote_loc.get('name'):
+            loc = SL.search([('name', '=', remote_loc['name']), ('usage', '=', 'internal')], limit=1)
+        if loc:
+            return loc
+
+        # fallback: Stock del almacén principal
+        wh = self.env['stock.warehouse'].sudo().search([], limit=1)
+        return wh.lot_stock_id if wh else SL.search([('usage', '=', 'internal')], limit=1)
 
 
     # === STOCK: proceso principal ===
@@ -702,7 +702,6 @@ def _map_remote_location_to_local(self, remote_loc, by_complete_name=True):
 
         _logger.info(f"[STOCK] Ajustes aplicados: {applied}, errores: {errors}")
         return True
-
 
 
 
