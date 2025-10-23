@@ -146,44 +146,288 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE CONTACTOS
     # =========================
-    def migrate_contacts(self):
-        uid, models = self.connect_to_odoo()
-        contacts = models.execute_kw(
-            self.db, uid, self.password,
-            'res.partner', 'search_read',
-            [[]],
-            {'fields': ['is_company', 'name', 'street', 'city', 'state_id', 'country_id',
-                        'vat', 'function', 'phone', 'email', 'l10n_cl_dte_email']}
-        )
+    # =========================
+    # CONTACTOS – Helpers
+    # =========================
 
-        for contact in contacts:
+    def _norm_str(self, v):
+        return (v or '').strip()
+
+    def _norm_email(self, v):
+        return self._norm_str(v).lower()
+
+    def _norm_rut(self, v):
+        """Normaliza RUT: sin puntos/espacios; DV con guion si falta."""
+        if not v:
+            return ''
+        s = str(v).strip().upper().replace('.', '').replace(' ', '')
+        if '-' not in s and len(s) > 1:
+            s = f"{s[:-1]}-{s[-1]}"
+        return s
+
+    def _find_country_by_name(self, name):
+        if not name:
+            return False
+        C = self.env['res.country'].sudo()
+        return C.search([('name', 'ilike', name)], limit=1).id
+
+    def _find_state_by_name(self, country_id, name):
+        if not (country_id and name):
+            return False
+        S = self.env['res.country.state'].sudo()
+        return S.search([('country_id', '=', country_id), ('name', 'ilike', name)], limit=1).id
+
+    def _find_city_commune(self, name):
+        """Ajusta si usas un modelo propio de comunas."""
+        return self._norm_str(name)
+
+    def _find_latam_id_type(self, code_or_name):
+        """Busca l10n_latam.identification.type por code o name (si existe)."""
+        if not self._local_field_exists('res.partner', 'l10n_latam_identification_type_id'):
+            return False
+        if not code_or_name:
+            return False
+        T = self.env['l10n_latam.identification.type'].sudo()
+        rec = T.search(['|', ('code', '=', code_or_name), ('name', 'ilike', code_or_name)], limit=1)
+        return rec.id or False
+
+    def _find_cl_taxpayer_type(self, sel_value_or_label):
+        """Mapea l10n_cl_sii_taxpayer_type aceptando valor o etiqueta (si existe)."""
+        field_name = 'l10n_cl_sii_taxpayer_type'
+        if not self._local_field_exists('res.partner', field_name):
+            return False
+        imf = self.env['ir.model.fields'].sudo().search([
+            ('model', '=', 'res.partner'), ('name', '=', field_name)
+        ], limit=1)
+        if not imf or not imf.selection:
+            return False
+        # selection (value,label) por líneas
+        options = {}
+        for line in imf.selection.split('\n'):
+            if ',' in line:
+                k, v = line.split(',', 1)
+                options[k] = v
+        # match directo por value
+        if sel_value_or_label in options:
+            return sel_value_or_label
+        # match por etiqueta
+        for k, label in options.items():
+            if sel_value_or_label and sel_value_or_label.lower() in (label or '').lower():
+                return k
+        return False
+
+    def _build_remote_contact_fields(self, models, db, uid, password):
+        """
+        Define alias por dato y arma la lista final de lectura según exista en la base remota.
+        """
+        aliases = {
+            'is_company':      ['company_type', 'is_company'],
+            'name':            ['name'],
+            'street':          ['street'],
+            'street2':         ['street2'],
+            'city':            ['l10n_cl_city', 'city', 'x_city'],
+            'state_id':        ['state_id'],
+            'country_id':      ['country_id'],
+            'zip':             ['zip', 'x_zip'],
+            'phone':           ['phone', 'x_phone'],
+            'mobile':          ['mobile', 'x_mobile'],
+            'email':           ['email', 'x_email'],
+            'website':         ['website', 'x_website'],
+            'vat':             ['vat', 'l10n_cl_vat', 'document_number', 'x_rut', 'x_vat'],
+            'dte_email':       ['l10n_cl_dte_email', 'dte_email', 'x_dte_email'],
+            'giro':            ['l10n_cl_activity_description', 'x_giro', 'activity_description', 'comment'],
+            'id_type':         ['l10n_latam_identification_type_id', 'x_idtype'],
+            'taxpayer_type':   ['l10n_cl_sii_taxpayer_type', 'x_sii_taxpayer_type', 'taxpayer_type'],
+            'function':        ['function', 'x_function'],
+        }
+        candidates = set()
+        for arr in aliases.values():
+            candidates.update(arr)
+        found = self._remote_fields(models, db, uid, password, 'res.partner', list(candidates))
+        mapping = {}
+        for logical, arr in aliases.items():
+            for f in arr:
+                if f in found:
+                    mapping[logical] = f
+                    break
+        to_read = sorted(set(mapping.values()) | {'name'})  # garantizar name
+        return mapping, to_read
+
+    def _is_empty_val(self, v):
+        """Qué se considera 'vacío' para no pisar datos locales."""
+        return v in (False, None, '')
+
+    def _merge_fill_missing(self, record, incoming_vals, include=False):
+        """
+        Devuelve solo campo:valor a escribir si el valor local está vacío.
+        Ignora claves inexistentes en el modelo (a menos que include=True).
+        """
+        fields_model = record._fields
+        out = {}
+        for k, v in incoming_vals.items():
+            if not include and k not in fields_model:
+                continue
             try:
-                local_contact_vals = {
-                    'is_company': contact.get('is_company'),
-                    'name': contact.get('name'),
-                    'street': contact.get('street') or '',
-                    'document_number': contact.get('vat', ''),  # si existe en tu modelo local
-                    'phone': contact.get('phone', ''),
-                    'email': contact.get('email', ''),
-                    'dte_email': contact.get('l10n_cl_dte_email', ''),
-                }
+                local_val = record[k]
+            except Exception:
+                continue
+            if self._is_empty_val(local_val) and not self._is_empty_val(v):
+                out[k] = v
+        return out
 
-                existing_contact = self.env['res.partner'].search(
-                    [('name', '=', contact.get('name')), ('vat', '=', contact.get('vat', ''))],
-                    limit=1
-                )
+    # =========================
+    # CONTACTOS – Migración (fill-missing)
+    # =========================
+    def migrate_contacts(self, commit_every=100, force_overwrite=False):
+        """
+        Migra contactos desde Odoo remoto.
+        Por defecto **NO sobrescribe**: solo completa campos vacíos del contacto local.
+        Si `force_overwrite=True`, sobrescribe con los valores remotos.
+        """
+        uid, models = self.connect_to_odoo()
 
-                if existing_contact:
-                    existing_contact.write(local_contact_vals)
-                    _logger.info(f"Contacto actualizado: {contact.get('name')}")
-                else:
-                    self.env['res.partner'].create(local_contact_vals)
-                    _logger.info(f"Contacto creado: {contact.get('name')}")
+        # Campos remotos (alias-safe)
+        mapping, fields_to_read = self._build_remote_contact_fields(models, self.db, uid, self.password)
 
-            except Exception as e:
-                _logger.error(f"Error al migrar el contacto {contact.get('name')}: {e}")
+        # IDs remotos
+        partner_ids = models.execute_kw(self.db, uid, self.password, 'res.partner', 'search', [[]])
+        total = len(partner_ids)
+        _logger.info(f"[PARTNER] Remotos a procesar: {total}")
+        BATCH = 500
 
-        _logger.info("Migración de contactos completada.")
+        Partner = self.env['res.partner'].sudo()
+
+        # Índices locales por vat y email para acelerar
+        vat_idx = {self._norm_rut(p.vat): p.id for p in Partner.search([('vat', '!=', False)])}
+        email_idx = {self._norm_email(p.email): p.id for p in Partner.search([('email', '!=', False)])}
+
+        def _find_local(vals_remote):
+            vat = self._norm_rut(vals_remote.get('vat'))
+            if vat and vat in vat_idx:
+                return Partner.browse(vat_idx[vat])
+            email = self._norm_email(vals_remote.get('email'))
+            if email and email in email_idx:
+                return Partner.browse(email_idx[email])
+            name = self._norm_str(vals_remote.get('name'))
+            city = self._norm_str(vals_remote.get('city'))
+            dom = [('name', '=', name)]
+            if city:
+                dom.append(('city', '=', city))
+            return Partner.search(dom, limit=1)
+
+        processed = 0
+
+        for i in range(0, total, BATCH):
+            batch_ids = partner_ids[i:i + BATCH]
+            partners = models.execute_kw(self.db, uid, self.password, 'res.partner', 'read', [batch_ids, fields_to_read])
+
+            for rp in partners:
+                try:
+                    # extractor remoto g() usando mapping
+                    def g(key, default=None):
+                        f = mapping.get(key)
+                        return rp.get(f) if f else default
+
+                    name = rp.get('name')
+                    vat = self._norm_rut(g('vat'))
+                    email = self._norm_email(g('email'))
+                    phone = self._norm_str(g('phone'))
+                    mobile = self._norm_str(g('mobile'))
+                    website = self._norm_str(g('website'))
+                    street = self._norm_str(g('street'))
+                    street2 = self._norm_str(g('street2'))
+                    city_in = self._norm_str(g('city'))
+                    zip_in = self._norm_str(g('zip'))
+                    dte_email = self._norm_email(g('dte_email'))
+                    function = self._norm_str(g('function'))
+                    giro = self._norm_str(g('giro'))
+
+                    is_company_val = g('is_company')
+                    if isinstance(is_company_val, str):
+                        is_company = (is_company_val == 'company')
+                    else:
+                        is_company = bool(is_company_val)
+
+                    # país/estado remotos (si vienen M2O tomamos el nombre)
+                    rc = g('country_id')
+                    remote_country_name = rc[1] if isinstance(rc, (list, tuple)) and len(rc) >= 2 else None
+                    rs = g('state_id')
+                    remote_state_name = rs[1] if isinstance(rs, (list, tuple)) and len(rs) >= 2 else None
+
+                    country_id = self._find_country_by_name(remote_country_name) if remote_country_name else False
+                    state_id = self._find_state_by_name(country_id, remote_state_name) if (country_id and remote_state_name) else False
+                    city = self._find_city_commune(city_in)
+
+                    # tipos fiscales (opcionales)
+                    id_type_id = False
+                    id_type_val = g('id_type')
+                    if self._local_field_exists('res.partner', 'l10n_latam_identification_type_id'):
+                        if isinstance(id_type_val, (list, tuple)) and len(id_type_val) >= 2:
+                            id_type_id = self._find_latam_id_type(id_type_val[1])
+                        else:
+                            id_type_id = self._find_latam_id_type(id_type_val)
+
+                    sii_taxpayer_type = False
+                    taxpayer_val = g('taxpayer_type')
+                    if self._local_field_exists('res.partner', 'l10n_cl_sii_taxpayer_type'):
+                        if isinstance(taxpayer_val, (list, tuple)) and len(taxpayer_val) >= 2:
+                            sii_taxpayer_type = self._find_cl_taxpayer_type(taxpayer_val[0]) or self._find_cl_taxpayer_type(taxpayer_val[1])
+                        else:
+                            sii_taxpayer_type = self._find_cl_taxpayer_type(taxpayer_val)
+
+                    # localizar partner local
+                    local = _find_local({'vat': vat, 'email': email, 'name': name, 'city': city})
+
+                    # vals entrantes (completos)
+                    incoming = {
+                        'is_company': is_company,
+                        'name': name,
+                        'street': street,
+                        'street2': street2,
+                        'city': city,
+                        'zip': zip_in,
+                        'phone': phone,
+                        'mobile': mobile,
+                        'email': email or False,
+                        'website': website or False,
+                        'vat': vat or False,
+                        'function': function or False,
+                    }
+                    if country_id:
+                        incoming['country_id'] = country_id
+                    if state_id:
+                        incoming['state_id'] = state_id
+                    if dte_email and self._local_field_exists('res.partner', 'l10n_cl_dte_email'):
+                        incoming['l10n_cl_dte_email'] = dte_email
+                    if giro and self._local_field_exists('res.partner', 'l10n_cl_activity_description'):
+                        incoming['l10n_cl_activity_description'] = giro
+                    if id_type_id:
+                        incoming['l10n_latam_identification_type_id'] = id_type_id
+                    if sii_taxpayer_type:
+                        incoming['l10n_cl_sii_taxpayer_type'] = sii_taxpayer_type
+
+                    # crear o actualizar respetando datos existentes
+                    if local and local.id:
+                        vals_write = incoming if force_overwrite \
+                                     else self._merge_fill_missing(local, incoming)
+                        if vals_write:
+                            local.write(vals_write)
+                            _logger.info(f"[PARTNER] Actualizado (fill_missing): {local.display_name} -> {list(vals_write.keys())}")
+                    else:
+                        local = Partner.create(incoming)
+                        _logger.info(f"[PARTNER] Creado: {local.display_name}")
+
+                    processed += 1
+                    if processed % commit_every == 0:
+                        self.env.cr.commit()
+                        _logger.info(f"[PARTNER] Proceso parcial: {processed}/{total}")
+
+                except Exception as e:
+                    self.env.cr.rollback()
+                    _logger.error(f"[PARTNER] Error migrando '{rp.get('name')}' : {e}")
+
+        _logger.info(f"[PARTNER] Finalizado. Total procesados: {processed}")
+        return True
 
     # =========================
     # MIGRACIÓN DE PRODUCTOS (Odoo 18 -> local)
