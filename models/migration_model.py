@@ -56,11 +56,9 @@ class ProductMigration(models.Model):
         raise Exception("Max retries reached for execute_kw_with_retry")
 
     def _get_local_publish_field(self):
-        """Devuelve 'is_published' si existe en local; de lo contrario 'website_published'."""
-        field_model = self.env['ir.model.fields'].sudo()
-        if field_model.search([('model', '=', 'product.template'), ('name', '=', 'is_published')], limit=1):
-            return 'is_published'
-        return 'website_published'
+        """Devuelve 'is_published' si existe en local; de lo contrario None (no publicar)."""
+        return 'is_published' if self._local_field_exists('product.template', 'is_published') else None
+
 
     def _find_local_category_id(self, remote_categ):
         """
@@ -77,20 +75,9 @@ class ProductMigration(models.Model):
 
     def _build_product_vals(self, product_data):
         """
-        Construye el diccionario de creación/actualización local incorporando:
-        - categoría (categ_id)
-        - referencia (default_code)
-        - e-commerce publicado (is_published/website_published)
-        - vendible (sale_ok)
-        - disponible en POS (available_in_pos)
+        Construye vals sin depender de website_published.
+        Publica sólo si existe is_published en local.
         """
-        publish_field = self._get_local_publish_field()
-
-        # Compatibilidad con remoto Odoo 18/16/15
-        remote_is_published = product_data.get('is_published')
-        if remote_is_published is None:
-            remote_is_published = product_data.get('website_published')
-
         vals = {
             'name': product_data.get('name'),
             'default_code': product_data.get('default_code'),
@@ -98,16 +85,25 @@ class ProductMigration(models.Model):
             'standard_price': product_data.get('standard_price'),
             'active': product_data.get('active'),
             'barcode': product_data.get('barcode'),
-            'sale_ok': product_data.get('sale_ok', True),
-            'available_in_pos': product_data.get('available_in_pos', False),
-            publish_field: bool(remote_is_published),
         }
-
+        # categoría
         categ_id = self._find_local_category_id(product_data.get('categ_id'))
         if categ_id:
             vals['categ_id'] = categ_id
 
+        # flags si existen en local
+        if self._local_field_exists('product.template', 'sale_ok'):
+            vals['sale_ok'] = bool(product_data.get('sale_ok', True))
+        if self._local_field_exists('product.template', 'available_in_pos'):
+            vals['available_in_pos'] = bool(product_data.get('available_in_pos', False))
+
+        # publicación sólo si is_published existe en local
+        publish_field = self._get_local_publish_field()  # 'is_published' o None
+        if publish_field:
+            vals[publish_field] = bool(product_data.get('is_published', False))
+
         return vals
+
 
     # =========================
     # MIGRACIÓN DE IMÁGENES (128)
@@ -450,10 +446,16 @@ class ProductMigration(models.Model):
             )
             _logger.info('Total de productos activos a migrar: %s', total_products)
 
-            fields_to_read = [
+            candidate_fields = [
                 'name', 'default_code', 'list_price', 'standard_price', 'active', 'barcode',
-                'categ_id', 'sale_ok', 'is_published', 'website_published', 'available_in_pos'
+                'categ_id', 'sale_ok', 'is_published', 'available_in_pos'
             ]
+            fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', candidate_fields)
+            # asegurar mínimos
+            for must in ('name', 'active'):
+                if must not in fields_to_read:
+                    fields_to_read.append(must)
+
 
             for offset in range(0, total_products, BATCH_SIZE):
                 product_batch = models.execute_kw(
@@ -1027,10 +1029,9 @@ class ProductDataJSON(models.Model):
 
     @api.model
     def _get_local_publish_field(self):
-        field_model = self.env['ir.model.fields'].sudo()
-        if field_model.search([('model', '=', 'product.template'), ('name', '=', 'is_published')], limit=1):
-            return 'is_published'
-        return 'website_published'
+        return 'is_published' if self.env['ir.model.fields'].sudo().search([
+            ('model', '=', 'product.template'), ('name', '=', 'is_published')
+        ], limit=1) else None
 
     @api.model
     def _find_local_category_id(self, remote_categ):
@@ -1069,6 +1070,8 @@ class ProductDataJSON(models.Model):
                         if remote_is_published is None:
                             remote_is_published = p.get('website_published')
 
+                        publish_field = self._get_local_publish_field()  # 'is_published' o None
+
                         vals = {
                             'name': name,
                             'default_code': p.get('default_code'),
@@ -1076,10 +1079,20 @@ class ProductDataJSON(models.Model):
                             'standard_price': p.get('standard_price', 0),
                             'active': p.get('active', True),
                             'barcode': p.get('barcode'),
-                            'sale_ok': p.get('sale_ok', True),
-                            'available_in_pos': p.get('available_in_pos', False),
-                            publish_field: bool(remote_is_published),
                         }
+                        # flags si existen
+                        if self.env['ir.model.fields'].sudo().search([('model','=','product.template'),('name','=','sale_ok')], limit=1):
+                            vals['sale_ok'] = p.get('sale_ok', True)
+                        if self.env['ir.model.fields'].sudo().search([('model','=','product.template'),('name','=','available_in_pos')], limit=1):
+                            vals['available_in_pos'] = p.get('available_in_pos', False)
+                        # publicación sólo is_published
+                        if publish_field:
+                            vals[publish_field] = bool(p.get('is_published', False))
+
+                        categ_id = self._find_local_category_id(p.get('categ_id'))
+                        if categ_id:
+                            vals['categ_id'] = categ_id
+
 
                         categ_id = self._find_local_category_id(p.get('categ_id'))
                         if categ_id:
