@@ -75,32 +75,39 @@ class ProductMigration(models.Model):
 
     def _build_product_vals(self, product_data):
         """
-        Construye vals sin depender de website_published.
-        Publica sólo si existe is_published en local.
+        Vals seguros para product.template:
+        - NO usa website_published.
+        - NO setea barcode en template (lo pondremos luego en la variante).
+        - Setea company_id explícito si target_company_id está definido.
         """
         vals = {
             'name': product_data.get('name'),
-            'default_code': product_data.get('default_code'),
-            'list_price': product_data.get('list_price'),
-            'standard_price': product_data.get('standard_price'),
-            'active': product_data.get('active'),
-            'barcode': product_data.get('barcode'),
+            'default_code': product_data.get('default_code') or False,
+            'list_price': product_data.get('list_price') or 0.0,
+            'standard_price': product_data.get('standard_price') or 0.0,
+            'active': product_data.get('active', True),
+            # 'barcode' -> se setea en la variante luego
         }
-        # categoría
-        categ_id = self._find_local_category_id(product_data.get('categ_id'))
-        if categ_id:
-            vals['categ_id'] = categ_id
+        # compañía explícita
+        if self.target_company_id:
+            vals['company_id'] = self.target_company_id.id
 
-        # flags si existen en local
-        if self._local_field_exists('product.template', 'sale_ok'):
+        # categoría (por nombre simple)
+        categ = product_data.get('categ_id')
+        if categ and isinstance(categ, (list, tuple)) and len(categ) >= 2:
+            name = categ[1]
+            cat = self.env['product.category'].sudo().search([('name', '=', name)], limit=1)
+            if not cat:
+                cat = self.env['product.category'].sudo().create({'name': name})
+            vals['categ_id'] = cat.id
+
+        PT = 'product.template'
+        if self._local_field_exists(PT, 'sale_ok'):
             vals['sale_ok'] = bool(product_data.get('sale_ok', True))
-        if self._local_field_exists('product.template', 'available_in_pos'):
+        if self._local_field_exists(PT, 'available_in_pos'):
             vals['available_in_pos'] = bool(product_data.get('available_in_pos', False))
-
-        # publicación sólo si is_published existe en local
-        publish_field = self._get_local_publish_field()  # 'is_published' o None
-        if publish_field:
-            vals[publish_field] = bool(product_data.get('is_published', False))
+        if self._local_field_exists(PT, 'is_published'):
+            vals['is_published'] = bool(product_data.get('is_published', False))
 
         return vals
 
@@ -430,73 +437,120 @@ class ProductMigration(models.Model):
     # =========================
     def migrate_products(self):
         """
-        Migra productos activos desde Odoo 18 (remoto) a Odoo 16/15 (local),
-        incluyendo categoría, referencia, flags de e-commerce y POS.
-        Omite productos con códigos/Barcodes existentes.
+        Migra productos desde remoto (12/18) a local (16/15):
+        - Sólo lee campos remotos existentes (sin website_published).
+        - Crea en la compañía elegida (target_company_id) usando with_company/force_company.
+        - Evita write inverso de barcode en template (lo setea en la variante).
+        - Commit por lotes para evitar rollback por timeout.
         """
+        import time
         BATCH_SIZE = 100
+        MAX_SECONDS = 90  # margen para no superar 120s de request
+        start = time.time()
+
         uid, models = self.connect_to_odoo()
         barcodes_seen = set()
 
-        try:
-            total_products = models.execute_kw(
-                self.db, uid, self.password,
-                'product.template', 'search_count',
-                [[('active', '=', True)]]
+        # campos remotos existentes
+        candidate_fields = [
+            'name', 'default_code', 'list_price', 'standard_price', 'active', 'barcode',
+            'categ_id', 'sale_ok', 'is_published', 'available_in_pos'
+        ]
+        fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', candidate_fields)
+        for must in ('name', 'active'):
+            if must not in fields_to_read:
+                fields_to_read.append(must)
+
+        total_products = models.execute_kw(self.db, uid, self.password, 'product.template', 'search_count', [[('active', '=', True)]])
+        _logger.info('Total de productos activos a migrar: %s', total_products)
+
+        # Contexto silencioso y con compañía forzada (si aplica)
+        ctx = dict(self.env.context or {})
+        ctx.update({
+            'tracking_disable': True,
+            'mail_create_nosubscribe': True,
+            'mail_notrack': True,
+            'mail_auto_subscribe_no_notify': True,
+            'no_send_mail': True,
+        })
+        if self.target_company_id:
+            ctx['force_company'] = self.target_company_id.id
+
+        # Helper para crear en compañía correcta
+        def _pt_env():
+            return self.env['product.template'].with_context(ctx).with_company(self.target_company_id) if self.target_company_id else self.env['product.template'].with_context(ctx)
+
+        created_count = 0
+        commit_every = self.force_commit_every or 100
+
+        for offset in range(0, total_products, BATCH_SIZE):
+            # corte preventivo por timeout
+            if time.time() - start > MAX_SECONDS:
+                _logger.info("[PROD] Corte preventivo en offset %s para evitar timeout; reejecuta para continuar.", offset)
+                break
+
+            product_batch = models.execute_kw(
+                self.db, uid, self.password, 'product.template', 'search_read',
+                [[('active', '=', True)]],
+                {'fields': fields_to_read, 'limit': BATCH_SIZE, 'offset': offset}
             )
-            _logger.info('Total de productos activos a migrar: %s', total_products)
 
-            candidate_fields = [
-                'name', 'default_code', 'list_price', 'standard_price', 'active', 'barcode',
-                'categ_id', 'sale_ok', 'is_published', 'available_in_pos'
-            ]
-            fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', candidate_fields)
-            # asegurar mínimos
-            for must in ('name', 'active'):
-                if must not in fields_to_read:
-                    fields_to_read.append(must)
+            for pdata in product_batch:
+                try:
+                    name = pdata.get('name')
+                    default_code = pdata.get('default_code')
+                    barcode = pdata.get('barcode') or False
 
+                    # evitar duplicados por default_code o name (en la compañía objetivo)
+                    if default_code:
+                        dom = [('default_code', '=', default_code)]
+                    else:
+                        dom = [('name', '=', name)]
+                    if self.target_company_id:
+                        dom = ['|', ('company_id', '=', False), ('company_id', '=', self.target_company_id.id)] + dom
 
-            for offset in range(0, total_products, BATCH_SIZE):
-                product_batch = models.execute_kw(
-                    self.db, uid, self.password,
-                    'product.template', 'search_read',
-                    [[('active', '=', True)]],
-                    {'fields': fields_to_read, 'limit': BATCH_SIZE, 'offset': offset}
-                )
+                    existing = self.env['product.template'].sudo().search(dom, limit=1)
+                    if existing:
+                        _logger.info("Producto ya existe localmente: %s, se omite.", existing.name)
+                        continue
 
-                for product_data in product_batch:
-                    try:
-                        default_code = product_data.get('default_code')
-                        name = product_data.get('name')
-                        barcode = product_data.get('barcode')
-
-                        domain = [('default_code', '=', default_code)] if default_code else [('name', '=', name)]
-                        existing_product = self.env['product.template'].sudo().search(domain, limit=1)
-                        if existing_product:
-                            _logger.info(f"Producto ya existe localmente: {existing_product.name}, se omite.")
+                    # evitar duplicado por barcode
+                    if barcode:
+                        if barcode in barcodes_seen:
+                            _logger.warning("Barcode duplicado visto en sesión: %s, se omite.", barcode)
                             continue
+                        bdom = [('barcode', '=', barcode)]
+                        if self.target_company_id:
+                            bdom = ['|', ('company_id', '=', False), ('company_id', '=', self.target_company_id.id)] + bdom
+                        if self.env['product.template'].sudo().search(bdom, limit=1):
+                            _logger.warning("Barcode ya existe en local: %s, se omite.", barcode)
+                            continue
+                        barcodes_seen.add(barcode)
 
-                        if barcode:
-                            if barcode in barcodes_seen:
-                                _logger.warning(f"Barcode duplicado ya visto en esta sesión: {barcode}, se omite.")
-                                continue
-                            if self.env['product.template'].sudo().search([('barcode', '=', barcode)], limit=1):
-                                _logger.warning(f"Barcode ya existe en local: {barcode}, se omite.")
-                                continue
-                            barcodes_seen.add(barcode)
+                    vals = self._build_product_vals(pdata)
+                    # 1) crea template (sin barcode)
+                    tpl = _pt_env().sudo().create(vals)
 
-                        product_vals = self._build_product_vals(product_data)
-                        new_product = self.env['product.template'].sudo().create(product_vals)
-                        _logger.info(f"Producto creado: {new_product.name} (ID {new_product.id})")
+                    # 2) setea barcode directo en la variante (evita inverse lento)
+                    if barcode and tpl.product_variant_id:
+                        tpl.product_variant_id.with_context(ctx).sudo().write({'barcode': barcode})
 
-                    except Exception as e:
-                        _logger.error(f"Error al procesar producto {product_data.get('name')}: {e}")
+                    created_count += 1
+                    _logger.info("Producto creado: %s (ID %s)", tpl.name, tpl.id)
 
-        except Exception as e:
-            _logger.error(f"Error general en la migración de productos: {e}")
-            raise UserError(f"Error general en la migración: {str(e)}")
+                    # commits periódicos para no perder trabajo en caso de timeout
+                    if created_count % commit_every == 0:
+                        self.env.cr.commit()
+                        _logger.info("[PROD] Commit de seguridad tras %s creados.", created_count)
 
+                except Exception as e:
+                    self.env.cr.rollback()
+                    _logger.error("Error al procesar producto %s: %s", pdata.get('name'), e)
+
+        # commit final
+        self.env.cr.commit()
+        _logger.info("[PROD] Finalizado. Creados en esta corrida: %s", created_count)
+        return True
     # =========================
     # EXPORTACIÓN A JSON (única versión)
     # =========================
