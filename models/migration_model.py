@@ -152,6 +152,12 @@ class ProductMigration(models.Model):
     # =========================
     # CONTACTOS – Helpers
     # =========================
+# ===== Helpers de matching por nombre (pegar dentro de ProductMigration) =====
+
+    def _norm_name(self, s):
+        s = (s or '').strip().lower()
+        # colapsa espacios múltiples
+        return ' '.join(s.split())
 
     def _norm_str(self, v):
         return (v or '').strip()
@@ -595,27 +601,19 @@ class ProductMigration(models.Model):
         """
         Copia imágenes desde Odoo remoto y escribe image_1920 en productos locales.
 
-        Parámetros:
-            force (bool): True = reescribe aunque ya exista imagen local.
-            prefer_variant (bool): True = prioriza image_variant_*; False = prioriza image_* de plantilla.
-            only_missing (bool): True = únicamente productos locales sin image_1920.
-            batch_size (int): tamaño del lote remoto.
-            limit (int|None): máximo de remotos a procesar; None = todos.
-
-        Comportamiento:
-            - Lee binarios con context {'bin_size': False} para traer base64 completo.
-            - Elige la mejor imagen disponible (1920 > 1024 > 512 > 256 > 128).
-            - Limpia thumbs locales para forzar recálculo.
-            - Hace logging detallado y continúa aunque un registro falle.
+        - Match local 'smart': x_external_id -> default_code -> barcode -> **nombre robusto**.
+        - Lee binarios completos (bin_size=False).
+        - Prioriza 1920; si no hay, baja a 1024/512/256/128; si prefer_variant=True, invierte prioridad.
+        - Si only_missing=True, sólo actualiza productos locales SIN image_1920.
+        - Logs detallados del motivo de skip.
         """
         uid, models = self.connect_to_odoo()
 
-        # 1) Obtener IDs remotos
+        # 1) IDs remotos
         try:
-            domain = [('active', '=', True)]
             remote_ids = self.execute_kw_with_retry(
                 models, self.db, uid, self.password,
-                'product.template', 'search', [domain]
+                'product.template', 'search', [[('active', '=', True)]]
             )
             if limit:
                 remote_ids = remote_ids[:limit]
@@ -624,15 +622,14 @@ class ProductMigration(models.Model):
             return False
 
         total = len(remote_ids)
-        _logger.info(f"[IMG] Productos remotos a revisar: {total} (limit={limit}, batch={batch_size}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})")
+        _logger.info(f"[IMG] Productos remotos a revisar: {total} (batch={batch_size}, limit={limit}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})")
 
-        # 2) Campos remotos seguros (incluye binarios)
+        # 2) Campos remotos (incluye binarios)
         base_candidates = [
             'id', 'name', 'default_code', 'barcode',
             'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
             'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
-            # opcional: si manejas ID externo custom
-            'x_external_id',
+            'x_external_id',  # si existiera
         ]
         fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', base_candidates)
         if 'id' not in fields_to_read:
@@ -640,47 +637,34 @@ class ProductMigration(models.Model):
         if 'name' not in fields_to_read:
             fields_to_read.insert(1, 'name')
 
-        # Helpers locales
         import hashlib, base64
-
         def _sha1_b64(b64str):
             if not b64str:
                 return None
             try:
                 raw = base64.b64decode(b64str)
             except Exception:
-                # En caso extremo, hashear string crudo para no romper el flujo
                 raw = b64str.encode('utf-8') if isinstance(b64str, str) else b64str
             return hashlib.sha1(raw).hexdigest()
 
         def _pick_best(p):
-            """
-            Devuelve la mejor imagen de p (dict de read XML/RPC), priorizando
-            plantilla o variante según prefer_variant.
-            Orden de tamaños: 1920 > 1024 > 512 > 256 > 128.
-            """
             def pick(prefix):
                 for size in ('1920', '1024', '512', '256', '128'):
                     k = f'{prefix}{size}'
-                    if k in p and p.get(k):
-                        return p.get(k)
+                    if p.get(k):
+                        return p[k]
                 return None
+            return (pick('image_variant_') or pick('image_')) if prefer_variant else (pick('image_') or pick('image_variant_'))
 
-            if prefer_variant:
-                return pick('image_variant_') or pick('image_')
-            else:
-                return pick('image_') or pick('image_variant_')
-
-        updated, skipped, missing, errors = 0, 0, 0, 0
+        updated = skipped_same = skipped_hasimg = noimg_remote = nomatch_local = errors = 0
 
         for i in range(0, total, batch_size):
             batch_ids = remote_ids[i:i + batch_size]
             try:
-                # 3) Leer lote remoto con bin_size=False para traer base64 completo
                 products = self.execute_kw_with_retry(
                     models, self.db, uid, self.password,
                     'product.template', 'read',
-                    [batch_ids, fields_to_read, {'bin_size': False}]
+                    [batch_ids, fields_to_read, {'bin_size': False}]  # <- trae base64 completo
                 )
             except Exception as e:
                 _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+batch_size}: {e}")
@@ -688,47 +672,56 @@ class ProductMigration(models.Model):
 
             for p in products:
                 try:
-                    # 4) Elegir imagen remota
+                    # 3) Imagen remota
                     img_b64 = _pick_best(p)
                     if not img_b64:
-                        missing += 1
+                        noimg_remote += 1
                         continue
 
-                    # 5) Resolver producto local
+                    # 4) Resolver producto local (smart)
+                    #    Primero tu método existente (x_external_id/default_code/barcode/name)
                     local_prod = self._find_local_product(p)
                     if not local_prod or not local_prod.id:
-                        _logger.warning(f"[IMG] Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
-                        missing += 1
+                        #    Si no encuentra, forzamos matching robusto por nombre
+                        local_prod = self._find_local_product_by_name(p.get('name'))
+
+                    if not local_prod or not local_prod.id:
+                        nomatch_local += 1
+                        _logger.debug(f"[IMG] Sin match local por nombre: '{p.get('name')}' (id remoto {p.get('id')}).")
                         continue
 
-                    # 6) Skip si ya tiene imagen y no se fuerza
+                    # 5) Filtros de actualización
+                    if only_missing and local_prod.image_1920 and not force:
+                        skipped_hasimg += 1
+                        continue
+
                     if local_prod.image_1920 and not force:
                         if _sha1_b64(local_prod.image_1920) == _sha1_b64(img_b64):
-                            skipped += 1
+                            skipped_same += 1
                             continue
 
-                    # 7) Escribir imagen exacta y limpiar thumbs
-                    vals = {
+                    # 6) Escribir imagen exacta y limpiar thumbs (fuerza recálculo)
+                    local_prod.sudo().write({
                         'image_128': False,
                         'image_256': False,
                         'image_512': False,
                         'image_1024': False,
                         'image_1920': img_b64,
-                    }
-                    local_prod.sudo().write(vals)
+                    })
                     updated += 1
 
+                    # commits periódicos
                     if updated % 50 == 0:
                         self.env.cr.commit()
-                        _logger.info(f"[IMG] Progreso: updated={updated}, skipped={skipped}, missing={missing}, errors={errors}")
+                        _logger.info(f"[IMG] Parcial: updated={updated}, same={skipped_same}, hasimg={skipped_hasimg}, noimg={noimg_remote}, nomatch={nomatch_local}, errors={errors}")
 
                 except Exception as e:
                     errors += 1
                     self.env.cr.rollback()
-                    _logger.error(f"[IMG] Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
+                    _logger.error(f"[IMG] Error migrando '{p.get('name')}' (remoto {p.get('id')}): {e}")
 
         self.env.cr.commit()
-        _logger.info(f"[IMG] FIN — updated={updated}, skipped={skipped}, missing={missing}, errors={errors}  (prefer_variant={prefer_variant}, force={force}, only_missing={only_missing})")
+        _logger.info(f"[IMG] FIN — updated={updated}, same={skipped_same}, hasimg={skipped_hasimg}, noimg_remote={noimg_remote}, nomatch_local={nomatch_local}, errors={errors}")
         return True
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
@@ -1039,6 +1032,40 @@ class ProductMigration(models.Model):
         _logger.info(f"[STOCK] Ajustes aplicados: {applied}, errores: {errors}")
         return True
 
+    def _find_local_product_by_name(self, name, company_id=None):
+        """
+        Busca product.template por nombre de forma robusta:
+        1) '=' exacto
+        2) 'ilike'
+        3) Normalizado (compara entre candidatos recientes)
+        Retorna recordset (product.template) o vacío.
+        """
+        PT = self.env['product.template'].sudo()
+        if not name:
+            return PT.browse()
+
+        dom_base = []
+        if company_id:
+            dom_base = ['|', ('company_id', '=', False), ('company_id', '=', company_id)]
+
+        # 1) Igual exacto
+        rec = PT.search(dom_base + [('name', '=', name)], limit=1)
+        if rec:
+            return rec
+
+        # 2) ILIKE (más laxa)
+        recs = PT.search(dom_base + [('name', 'ilike', name)], limit=5, order='id desc')
+        if not recs:
+            return PT.browse()
+
+        # 3) Normalización para elegir el mejor
+        target = self._norm_name(name)
+        best = None
+        for r in recs:
+            if self._norm_name(r.name) == target:
+                best = r
+                break
+        return best or recs[0]
 
 
 # === Mapeo local: ya no depende de 'external_id'; si tienes x_external_id lo usa si existe ===
