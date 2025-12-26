@@ -647,14 +647,30 @@ class ProductMigration(models.Model):
                 raw = b64str.encode('utf-8') if isinstance(b64str, str) else b64str
             return hashlib.sha1(raw).hexdigest()
 
-        def _pick_best(p):
+        def _pick_best(self, p, prefer_variant=False):
+            """
+            Devuelve el mejor base64 disponible, soportando campos modernos (13+)
+            y legados (Odoo 12):
+            - Modernos plantilla: image_1920/1024/512/256/128
+            - Modernos variante:  image_variant_*
+            - Legado plantilla:   image, image_medium, image_small
+            - Legado variante:    (no existe en 12)
+            """
+            # Modernos
             def pick(prefix):
                 for size in ('1920', '1024', '512', '256', '128'):
                     k = f'{prefix}{size}'
                     if p.get(k):
                         return p[k]
                 return None
-            return (pick('image_variant_') or pick('image_')) if prefer_variant else (pick('image_') or pick('image_variant_'))
+
+            # Legado (12)
+            legacy = p.get('image') or p.get('image_medium') or p.get('image_small')
+
+            if prefer_variant:
+                return pick('image_variant_') or pick('image_') or legacy
+            else:
+                return pick('image_') or pick('image_variant_') or legacy
 
         updated = skipped_same = skipped_hasimg = noimg_remote = nomatch_local = errors = 0
 
