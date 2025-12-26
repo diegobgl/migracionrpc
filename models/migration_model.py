@@ -601,11 +601,11 @@ class ProductMigration(models.Model):
         """
         Copia imágenes desde Odoo remoto y escribe image_1920 en productos locales.
 
-        - Match local 'smart': x_external_id -> default_code -> barcode -> **nombre robusto**.
-        - Lee binarios completos (bin_size=False).
+        - Soporta Odoo 12 (image, image_medium, image_small) y 13+ (image_*/image_variant_*).
+        - Lee binarios completos (bin_size=False) para obtener base64 real.
         - Prioriza 1920; si no hay, baja a 1024/512/256/128; si prefer_variant=True, invierte prioridad.
-        - Si only_missing=True, sólo actualiza productos locales SIN image_1920.
-        - Logs detallados del motivo de skip.
+        - only_missing=True -> solo actualiza productos que NO tienen image_1920.
+        - Matching local: x_external_id -> default_code -> barcode -> nombre (robusto).
         """
         uid, models = self.connect_to_odoo()
 
@@ -622,14 +622,21 @@ class ProductMigration(models.Model):
             return False
 
         total = len(remote_ids)
-        _logger.info(f"[IMG] Productos remotos a revisar: {total} (batch={batch_size}, limit={limit}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})")
+        _logger.info(
+            f"[IMG] Productos remotos a revisar: {total} "
+            f"(batch={batch_size}, limit={limit}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})"
+        )
 
-        # 2) Campos remotos (incluye binarios)
+        # 2) Campos remotos (incluye modernos y legados)
         base_candidates = [
             'id', 'name', 'default_code', 'barcode',
+            # modernos (13+)
             'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
             'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
-            'x_external_id',  # si existiera
+            # legados (12)
+            'image', 'image_medium', 'image_small',
+            # opcional
+            'x_external_id',
         ]
         fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', base_candidates)
         if 'id' not in fields_to_read:
@@ -637,26 +644,26 @@ class ProductMigration(models.Model):
         if 'name' not in fields_to_read:
             fields_to_read.insert(1, 'name')
 
+        # Helpers
         import hashlib, base64
+
         def _sha1_b64(b64str):
             if not b64str:
                 return None
             try:
-                raw = base64.b64decode(b64str)
+                raw = base64.b64decode(b64str) if isinstance(b64str, str) else b64str
             except Exception:
-                raw = b64str.encode('utf-8') if isinstance(b64str, str) else b64str
+                raw = (b64str or '').encode('utf-8') if isinstance(b64str, str) else b''
             return hashlib.sha1(raw).hexdigest()
 
-        def _pick_best(self, p, prefer_variant=False):
+        def _pick_best(p):
             """
             Devuelve el mejor base64 disponible, soportando campos modernos (13+)
             y legados (Odoo 12):
             - Modernos plantilla: image_1920/1024/512/256/128
             - Modernos variante:  image_variant_*
             - Legado plantilla:   image, image_medium, image_small
-            - Legado variante:    (no existe en 12)
             """
-            # Modernos
             def pick(prefix):
                 for size in ('1920', '1024', '512', '256', '128'):
                     k = f'{prefix}{size}'
@@ -664,7 +671,6 @@ class ProductMigration(models.Model):
                         return p[k]
                 return None
 
-            # Legado (12)
             legacy = p.get('image') or p.get('image_medium') or p.get('image_small')
 
             if prefer_variant:
@@ -681,9 +687,8 @@ class ProductMigration(models.Model):
                     models, self.db, uid, self.password,
                     'product.template', 'read',
                     [batch_ids, fields_to_read],
-                    {'context': {'bin_size': False}}  # <- BIEN: en kwargs.context
+                    {'context': {'bin_size': False}}  # <- trae base64 completo
                 )
-
             except Exception as e:
                 _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+batch_size}: {e}")
                 continue
@@ -692,15 +697,18 @@ class ProductMigration(models.Model):
                 try:
                     # 3) Imagen remota
                     img_b64 = _pick_best(p)
-                    if not img_b64:
+                    if not img_b64 or isinstance(img_b64, int):
+                        # int => bin_size=True (tamaño en bytes); o no hay imagen
+                        if isinstance(img_b64, int):
+                            _logger.warning("[IMG] Imagen llegó como entero (bin_size activo). "
+                                            "Revisa context bin_size=False. Remoto id=%s name=%s",
+                                            p.get('id'), p.get('name'))
                         noimg_remote += 1
                         continue
 
-                    # 4) Resolver producto local (smart)
-                    #    Primero tu método existente (x_external_id/default_code/barcode/name)
+                    # 4) Resolver producto local (smart + nombre robusto)
                     local_prod = self._find_local_product(p)
                     if not local_prod or not local_prod.id:
-                        #    Si no encuentra, forzamos matching robusto por nombre
                         local_prod = self._find_local_product_by_name(p.get('name'))
 
                     if not local_prod or not local_prod.id:
@@ -731,7 +739,10 @@ class ProductMigration(models.Model):
                     # commits periódicos
                     if updated % 50 == 0:
                         self.env.cr.commit()
-                        _logger.info(f"[IMG] Parcial: updated={updated}, same={skipped_same}, hasimg={skipped_hasimg}, noimg={noimg_remote}, nomatch={nomatch_local}, errors={errors}")
+                        _logger.info(
+                            "[IMG] Parcial: updated=%s, same=%s, hasimg=%s, noimg=%s, nomatch=%s, errors=%s",
+                            updated, skipped_same, skipped_hasimg, noimg_remote, nomatch_local, errors
+                        )
 
                 except Exception as e:
                     errors += 1
@@ -739,7 +750,10 @@ class ProductMigration(models.Model):
                     _logger.error(f"[IMG] Error migrando '{p.get('name')}' (remoto {p.get('id')}): {e}")
 
         self.env.cr.commit()
-        _logger.info(f"[IMG] FIN — updated={updated}, same={skipped_same}, hasimg={skipped_hasimg}, noimg_remote={noimg_remote}, nomatch_local={nomatch_local}, errors={errors}")
+        _logger.info(
+            "[IMG] FIN — updated=%s, same=%s, hasimg=%s, noimg_remote=%s, nomatch_local=%s, errors=%s",
+            updated, skipped_same, skipped_hasimg, noimg_remote, nomatch_local, errors
+        )
         return True
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
