@@ -664,8 +664,10 @@ class ProductMigration(models.Model):
                 products = self.execute_kw_with_retry(
                     models, self.db, uid, self.password,
                     'product.template', 'read',
-                    [batch_ids, fields_to_read, {'bin_size': False}]  # <- trae base64 completo
+                    [batch_ids, fields_to_read],
+                    {'context': {'bin_size': False}}  # <- BIEN: en kwargs.context
                 )
+
             except Exception as e:
                 _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+batch_size}: {e}")
                 continue
