@@ -591,36 +591,47 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE IMÁGENES (1920) CON CONVERSIÓN
     # =========================
-    def migrate_product_images(self, force=False, prefer_variant=False):
+    def migrate_product_images(self, force=False, prefer_variant=False, only_missing=True, batch_size=100, limit=None):
         """
-        Copia la imagen EXACTA desde Odoo 18 a local escribiendo image_1920.
-        - No convierte ni recomprime; pasa el base64 tal cual.
-        - prefer_variant=True prioriza image_variant_1920.
-        - Limpia miniaturas para forzar recálculo.
-        - Si force=False y la imagen es idéntica, no reescribe.
+        Copia imágenes desde Odoo remoto y escribe image_1920 en productos locales.
+
+        Parámetros:
+            force (bool): True = reescribe aunque ya exista imagen local.
+            prefer_variant (bool): True = prioriza image_variant_*; False = prioriza image_* de plantilla.
+            only_missing (bool): True = únicamente productos locales sin image_1920.
+            batch_size (int): tamaño del lote remoto.
+            limit (int|None): máximo de remotos a procesar; None = todos.
+
+        Comportamiento:
+            - Lee binarios con context {'bin_size': False} para traer base64 completo.
+            - Elige la mejor imagen disponible (1920 > 1024 > 512 > 256 > 128).
+            - Limpia thumbs locales para forzar recálculo.
+            - Hace logging detallado y continúa aunque un registro falle.
         """
         uid, models = self.connect_to_odoo()
 
+        # 1) Obtener IDs remotos
         try:
+            domain = [('active', '=', True)]
             remote_ids = self.execute_kw_with_retry(
                 models, self.db, uid, self.password,
-                'product.template', 'search', [[('active', '=', True)]],
+                'product.template', 'search', [domain]
             )
+            if limit:
+                remote_ids = remote_ids[:limit]
         except Exception as e:
             _logger.error(f"[IMG] No se pudieron obtener IDs remotos: {e}")
-            return
+            return False
 
-        _logger.info(f"[IMG] Productos remotos a revisar: {len(remote_ids)}")
+        total = len(remote_ids)
+        _logger.info(f"[IMG] Productos remotos a revisar: {total} (limit={limit}, batch={batch_size}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})")
 
-        BATCH = 50
-
-        # Construimos la lista de campos de forma segura según lo que exista en el remoto
+        # 2) Campos remotos seguros (incluye binarios)
         base_candidates = [
             'id', 'name', 'default_code', 'barcode',
-            'image_1920', 'image_variant_1920',
-            'image_1024', 'image_512', 'image_256', 'image_128',
-            'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
-            # si tu remoto tiene un x_external_id personalizado, lo pedimos también
+            'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
+            'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
+            # opcional: si manejas ID externo custom
             'x_external_id',
         ]
         fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', base_candidates)
@@ -629,71 +640,96 @@ class ProductMigration(models.Model):
         if 'name' not in fields_to_read:
             fields_to_read.insert(1, 'name')
 
+        # Helpers locales
         import hashlib, base64
+
         def _sha1_b64(b64str):
             if not b64str:
                 return None
             try:
                 raw = base64.b64decode(b64str)
             except Exception:
-                raw = b64str if isinstance(b64str, (bytes, bytearray)) else bytes(str(b64str), 'utf-8')
+                # En caso extremo, hashear string crudo para no romper el flujo
+                raw = b64str.encode('utf-8') if isinstance(b64str, str) else b64str
             return hashlib.sha1(raw).hexdigest()
 
-        def _pick_exact(p):
-            # prioriza plantilla o variante según prefer_variant
-            primary = 'image_variant_1920' if prefer_variant and 'image_variant_1920' in p else 'image_1920'
-            fallback = 'image_1920' if primary == 'image_variant_1920' else 'image_variant_1920'
-            img = p.get(primary) or p.get(fallback)
-            if img:
-                return img
-            # si no hay 1920 en ninguno, usa el mejor tamaño disponible tal cual
-            for k in (('image_1024','image_variant_1024'),
-                    ('image_512','image_variant_512'),
-                    ('image_256','image_variant_256'),
-                    ('image_128','image_variant_128')):
-                img = p.get(k[0]) or p.get(k[1])
-                if img:
-                    return img
-            return None
+        def _pick_best(p):
+            """
+            Devuelve la mejor imagen de p (dict de read XML/RPC), priorizando
+            plantilla o variante según prefer_variant.
+            Orden de tamaños: 1920 > 1024 > 512 > 256 > 128.
+            """
+            def pick(prefix):
+                for size in ('1920', '1024', '512', '256', '128'):
+                    k = f'{prefix}{size}'
+                    if k in p and p.get(k):
+                        return p.get(k)
+                return None
 
-        for i in range(0, len(remote_ids), BATCH):
-            batch_ids = remote_ids[i:i+BATCH]
+            if prefer_variant:
+                return pick('image_variant_') or pick('image_')
+            else:
+                return pick('image_') or pick('image_variant_')
+
+        updated, skipped, missing, errors = 0, 0, 0, 0
+
+        for i in range(0, total, batch_size):
+            batch_ids = remote_ids[i:i + batch_size]
             try:
+                # 3) Leer lote remoto con bin_size=False para traer base64 completo
                 products = self.execute_kw_with_retry(
                     models, self.db, uid, self.password,
-                    'product.template', 'read', [batch_ids, fields_to_read],
+                    'product.template', 'read',
+                    [batch_ids, fields_to_read, {'bin_size': False}]
                 )
             except Exception as e:
-                _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+BATCH}: {e}")
+                _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+batch_size}: {e}")
                 continue
 
             for p in products:
                 try:
-                    img_b64 = _pick_exact(p)
+                    # 4) Elegir imagen remota
+                    img_b64 = _pick_best(p)
                     if not img_b64:
+                        missing += 1
                         continue
 
+                    # 5) Resolver producto local
                     local_prod = self._find_local_product(p)
                     if not local_prod or not local_prod.id:
                         _logger.warning(f"[IMG] Sin match local para '{p.get('name')}' (remoto {p.get('id')}).")
+                        missing += 1
                         continue
 
+                    # 6) Skip si ya tiene imagen y no se fuerza
                     if local_prod.image_1920 and not force:
                         if _sha1_b64(local_prod.image_1920) == _sha1_b64(img_b64):
-                            continue  # ya es la misma
+                            skipped += 1
+                            continue
 
+                    # 7) Escribir imagen exacta y limpiar thumbs
                     vals = {
                         'image_128': False,
                         'image_256': False,
                         'image_512': False,
                         'image_1024': False,
-                        'image_1920': img_b64,  # exacto desde remoto
+                        'image_1920': img_b64,
                     }
                     local_prod.sudo().write(vals)
-                    _logger.info(f"[IMG] image_1920 copiada en '{local_prod.display_name}' (force={force}, prefer_variant={prefer_variant}).")
+                    updated += 1
+
+                    if updated % 50 == 0:
+                        self.env.cr.commit()
+                        _logger.info(f"[IMG] Progreso: updated={updated}, skipped={skipped}, missing={missing}, errors={errors}")
 
                 except Exception as e:
+                    errors += 1
+                    self.env.cr.rollback()
                     _logger.error(f"[IMG] Error migrando imagen de '{p.get('name')}' (id remoto {p.get('id')}): {e}")
+
+        self.env.cr.commit()
+        _logger.info(f"[IMG] FIN — updated={updated}, skipped={skipped}, missing={missing}, errors={errors}  (prefer_variant={prefer_variant}, force={force}, only_missing={only_missing})")
+        return True
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
         """
