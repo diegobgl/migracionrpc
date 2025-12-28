@@ -1192,72 +1192,162 @@ class ProductDataJSON(models.Model):
         return False
 
     @api.model
-    def process_stored_product_batches(self):
-        batches = self.search([])
+    def process_stored_product_batches(self, commit_every=200, dry_run=False, target_company_id=False):
+        """
+        Procesa todos los registros product.data.json y **solo crea productos nuevos**.
+        - Match de existencia por prioridad: default_code -> barcode -> name
+        - No actualiza existentes.
+        - Evita 'website_published'; sólo usa 'is_published' si existe localmente.
+        - Hace commit cada `commit_every` creaciones para evitar timeouts.
+        - Si `dry_run=True`, no crea ni borra lotes: sólo log.
+        - Si `target_company_id` se pasa, crea asignando esa compañía cuando aplica.
+        """
+        PT = self.env['product.template'].sudo()
         publish_field = self._get_local_publish_field()
+
+        batches = self.search([])
+        if not batches:
+            _logger.info("[JSON] No hay lotes pendientes.")
+            return True
+
+        # Precache de existentes para acelerar (por code/barcode/name)
+        def _index_existentes():
+            # Traemos sólo lo necesario
+            fields = ['id', 'name', 'default_code', 'barcode']
+            dom = []
+            if target_company_id:
+                dom = ['|', ('company_id', '=', False), ('company_id', '=', target_company_id)]
+            recs = PT.search(dom)
+            codes = set(filter(None, recs.mapped('default_code')))
+            barcs = set(filter(None, recs.mapped('barcode')))
+            names = set(filter(None, recs.mapped('name')))
+            return codes, barcs, names
+
+        codes_idx, barcodes_idx, names_idx = _index_existentes()
+
+        def _exists_locally(p):
+            dc = (p.get('default_code') or '').strip()
+            if dc and dc in codes_idx:
+                return True
+            bc = (p.get('barcode') or '').strip()
+            if bc and bc in barcodes_idx:
+                return True
+            nm = (p.get('name') or '').strip()
+            if nm and nm in names_idx:
+                return True
+            return False
+
+        created_total = 0
+        skipped_existing = 0
+        errors = 0
 
         for batch in batches:
             try:
-                self.env.cr.commit()  # Guardar y reiniciar cursor entre lotes
-                products = json.loads(batch.data)
-                _logger.info(f"Procesando lote de {len(products)} productos")
-
-                for i, p in enumerate(products):
-                    try:
-                        name = p.get('name')
-                        if not name:
-                            continue
-
-                        domain = [('default_code', '=', p.get('default_code'))] if p.get('default_code') else [('name', '=', name)]
-                        if self.env['product.template'].sudo().search(domain, limit=1):
-                            continue
-
-                        if p.get('barcode') and self.env['product.template'].sudo().search([('barcode', '=', p['barcode'])], limit=1):
-                            p['barcode'] = False  # Elimina duplicado
-
-                        remote_is_published = p.get('is_published')
-                        if remote_is_published is None:
-                            remote_is_published = p.get('website_published')
-
-                        publish_field = self._get_local_publish_field()  # 'is_published' o None
-
-                        vals = {
-                            'name': name,
-                            'default_code': p.get('default_code'),
-                            'list_price': p.get('list_price', 0),
-                            'standard_price': p.get('standard_price', 0),
-                            'active': p.get('active', True),
-                            'barcode': p.get('barcode'),
-                        }
-                        # flags si existen
-                        if self.env['ir.model.fields'].sudo().search([('model','=','product.template'),('name','=','sale_ok')], limit=1):
-                            vals['sale_ok'] = p.get('sale_ok', True)
-                        if self.env['ir.model.fields'].sudo().search([('model','=','product.template'),('name','=','available_in_pos')], limit=1):
-                            vals['available_in_pos'] = p.get('available_in_pos', False)
-                        # publicación sólo is_published
-                        if publish_field:
-                            vals[publish_field] = bool(p.get('is_published', False))
-
-                        categ_id = self._find_local_category_id(p.get('categ_id'))
-                        if categ_id:
-                            vals['categ_id'] = categ_id
-
-
-                        categ_id = self._find_local_category_id(p.get('categ_id'))
-                        if categ_id:
-                            vals['categ_id'] = categ_id
-
-                        self.env['product.template'].sudo().create(vals)
-
-                        if (i + 1) % 10 == 0:
-                            self.env.cr.commit()  # Comitea cada 10 para evitar cierre de cursor
-
-                    except Exception as e:
-                        _logger.error(f"Error con producto {p.get('name')}: {e}")
-                        self.env.cr.rollback()
-
-                batch.sudo().unlink()
-
+                products = json.loads(batch.data or '[]')
             except Exception as e:
-                _logger.error(f"Error al procesar lote: {e}")
-                self.env.cr.rollback()
+                _logger.error(f"[JSON] Lote inválido (id={batch.id}): {e}")
+                continue
+
+            if not products:
+                _logger.info(f"[JSON] Lote vacío (id={batch.id}), se elimina.")
+                if not dry_run:
+                    batch.sudo().unlink()
+                continue
+
+            _logger.info(f"[JSON] Lote {batch.id}: {len(products)} productos a evaluar (solo-nuevos).")
+
+            to_create = []
+            for p in products:
+                try:
+                    # Saltar si ya existe por default_code/barcode/name
+                    if _exists_locally(p):
+                        skipped_existing += 1
+                        continue
+
+                    # Construir vals de forma segura
+                    vals = {
+                        'name': p.get('name'),
+                        'default_code': p.get('default_code') or False,
+                        'list_price': p.get('list_price', 0.0),
+                        'standard_price': p.get('standard_price', 0.0),
+                        'active': bool(p.get('active', True)),
+                        # NO poner barcode aquí si ya lo tiene otro producto,
+                        # lo verificamos antes de asignarlo abajo.
+                    }
+
+                    # compañía destino explícita (si corresponde)
+                    if target_company_id:
+                        vals['company_id'] = target_company_id
+
+                    # flags si existen en esta base
+                    if self.env['ir.model.fields'].sudo().search(
+                        [('model','=','product.template'),('name','=','sale_ok')], limit=1):
+                        vals['sale_ok'] = bool(p.get('sale_ok', True))
+                    if self.env['ir.model.fields'].sudo().search(
+                        [('model','=','product.template'),('name','=','available_in_pos')], limit=1):
+                        vals['available_in_pos'] = bool(p.get('available_in_pos', False))
+                    if publish_field:
+                        # NO usamos website_published en 16; sólo is_published si existe
+                        vals[publish_field] = bool(p.get('is_published', False))
+
+                    # categoría local por nombre
+                    categ_id = self._find_local_category_id(p.get('categ_id'))
+                    if categ_id:
+                        vals['categ_id'] = categ_id
+
+                    # barcode: sólo si no existe ya en local
+                    barcode = (p.get('barcode') or '').strip()
+                    if barcode and barcode not in barcodes_idx:
+                        vals['barcode'] = barcode
+
+                    to_create.append(vals)
+
+                except Exception as e:
+                    errors += 1
+                    _logger.error(f"[JSON] Error preparando '{p.get('name')}': {e}")
+
+            # Crear en bloques
+            if to_create:
+                _logger.info(f"[JSON] Lote {batch.id}: {len(to_create)} productos nuevos serán creados.")
+                if not dry_run:
+                    # creación controlada por chunks
+                    chunk = []
+                    for idx, vals in enumerate(to_create, 1):
+                        try:
+                            rec = PT.create(vals)
+                            created_total += 1
+
+                            # actualizar índices in-memory para evitar duplicados en el mismo lote
+                            if rec.default_code:
+                                codes_idx.add(rec.default_code)
+                            if rec.barcode:
+                                barcodes_idx.add(rec.barcode)
+                            if rec.name:
+                                names_idx.add(rec.name)
+
+                            chunk.append(rec.id)
+                            if created_total % commit_every == 0:
+                                self.env.cr.commit()
+                                _logger.info(f"[JSON] Commit de seguridad: {created_total} creados.")
+
+                        except Exception as e:
+                            errors += 1
+                            self.env.cr.rollback()
+                            _logger.error(f"[JSON] Error creando '{vals.get('name')}': {e}")
+
+            else:
+                _logger.info(f"[JSON] Lote {batch.id}: no hay productos nuevos (todo ya existe).")
+
+            # limpiar lote procesado
+            if not dry_run:
+                try:
+                    batch.sudo().unlink()
+                except Exception as e:
+                    _logger.warning(f"[JSON] No se pudo remover el lote {batch.id}: {e}")
+
+        # commit final
+        if not dry_run:
+            self.env.cr.commit()
+
+        _logger.info(f"[JSON] FIN: creados={created_total}, existentes_saltados={skipped_existing}, errores={errors}")
+        return True
