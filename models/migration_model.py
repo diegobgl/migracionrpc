@@ -155,6 +155,56 @@ class ProductMigration(models.Model):
 # ===== Helpers de matching por nombre (pegar dentro de ProductMigration) =====
 
     # --- Helpers faltantes / acteco ---
+    # --- Helpers robustos ---
+    def _m2o_name(self, v):
+        """Devuelve etiqueta de un many2one leído por XML-RPC: (id, name) -> name"""
+        if isinstance(v, (list, tuple)):
+            if len(v) >= 2 and isinstance(v[1], str):
+                return v[1]
+            if len(v) >= 1 and isinstance(v[0], str):
+                return v[0]
+            return ''
+        return v or ''
+
+    def _to_text(self, v):
+        """Normaliza a texto seguro para campos char/email/phone, tolerando listas, bytes, números."""
+        if v is None or v is False:
+            return ''
+        if isinstance(v, (list, tuple)):
+            # Si es M2O o lista simple, tomar la etiqueta más “humana”
+            return self._to_text(self._m2o_name(v))
+        if isinstance(v, bytes):
+            try:
+                v = v.decode('utf-8', 'ignore')
+            except Exception:
+                v = str(v)
+        elif isinstance(v, (int, float)):
+            v = str(v)
+        elif isinstance(v, bool):
+            return ''
+        return str(v).strip()
+
+    def _norm_str(self, v):
+        return self._to_text(v)
+
+    def _norm_email(self, v):
+        return self._to_text(v).lower()
+
+    def _norm_rut(self, v):
+        s = self._to_text(v).upper().replace('.', '').replace(' ', '')
+        if not s:
+            return ''
+        if '-' not in s and len(s) > 1:
+            s = f"{s[:-1]}-{s[-1]}"
+        # Si viene con prefijo CL, mantenerlo
+        if not s.startswith('CL') and any(ch.isalpha() for ch in s[:2]):
+            pass
+        return s
+
+
+
+
+
 
     def _remote_model_has(self, models, db, uid, password, model_name, field_name):
         """
@@ -378,33 +428,35 @@ class ProductMigration(models.Model):
     # =========================
     # CONTACTOS – Migración (fill-missing)
     # =========================
-    def migrate_contacts(self, commit_every=100, force_overwrite=False, merge_actecos=False):
+    def migrate_contacts(self, commit_every=10, force_overwrite=False, merge_actecos=True):
         """
         Migra contactos desde Odoo remoto (12 -> 16).
-        - No sobrescribe por defecto: completa campos vacíos (fill-missing).
-        - force_overwrite=True: sobrescribe todo.
-        - merge_actecos=True: fusiona acteco_ids (many2many) en vez de reemplazar.
+        - Normaliza valores list/M2O a texto.
+        - Hace commit cada N para no perder avances si hay errores intermedios.
         """
         uid, models = self.connect_to_odoo()
 
-        # 1) Campos remotos disponibles y mapeo lógico -> real
+        has_acteco_local = self._local_field_exists('res.partner', 'acteco_ids')
+        if not has_acteco_local:
+            _logger.warning("[PARTNER] Campo acteco_ids no existe en local; se omitirá.")
+
         mapping, fields_to_read = self._build_remote_contact_fields(models, self.db, uid, self.password)
+        # asegurar que pedimos acteco_ids si existe en remoto
+        try:
+            if 'acteco_ids' not in mapping and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', 'acteco_ids'):
+                mapping['acteco_ids'] = 'acteco_ids'
+                if 'acteco_ids' not in fields_to_read:
+                    fields_to_read.append('acteco_ids')
+        except Exception:
+            pass
 
-        # Asegurar que leemos acteco_ids si existe en remoto
-        if 'acteco_ids' not in mapping and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', 'acteco_ids'):
-            mapping['acteco_ids'] = 'acteco_ids'
-            if 'acteco_ids' not in fields_to_read:
-                fields_to_read.append('acteco_ids')
-
-        # 2) Ids remotos a procesar
         partner_ids = models.execute_kw(self.db, uid, self.password, 'res.partner', 'search', [[]])
         total = len(partner_ids)
         _logger.info(f"[PARTNER] Remotos a procesar: {total}")
-        BATCH = 500
+        BATCH = 400
 
         Partner = self.env['res.partner'].sudo()
 
-        # 3) Índices locales para acelerar búsqueda por vat/email
         vat_idx = {self._norm_rut(p.vat): p.id for p in Partner.search([('vat', '!=', False)])}
         email_idx = {self._norm_email(p.email): p.id for p in Partner.search([('email', '!=', False)])}
 
@@ -422,21 +474,20 @@ class ProductMigration(models.Model):
                 dom.append(('city', '=', city))
             return Partner.search(dom, limit=1)
 
-        processed = 0
+        processed = created = updated = merged_act = replaced_act = 0
 
         for i in range(0, total, BATCH):
-            batch_ids = partner_ids[i:i + BATCH]
+            batch_ids = partner_ids[i:i+BATCH]
             partners = models.execute_kw(self.db, uid, self.password, 'res.partner', 'read', [batch_ids, fields_to_read])
 
             for rp in partners:
                 try:
-                    # Helper para extraer respetando mapping
                     def g(key, default=None):
                         f = mapping.get(key)
                         return rp.get(f) if f else default
 
-                    name = rp.get('name')
-                    vat = self._norm_rut(g('vat'))
+                    name = self._norm_str(rp.get('name'))
+                    vat  = self._norm_rut(g('vat'))
                     email = self._norm_email(g('email'))
                     phone = self._norm_str(g('phone'))
                     mobile = self._norm_str(g('mobile'))
@@ -449,21 +500,21 @@ class ProductMigration(models.Model):
                     function = self._norm_str(g('function'))
                     giro = self._norm_str(g('giro'))
 
-                    # is_company: puede venir como 'company' o boolean
                     is_company_val = g('is_company')
-                    is_company = (is_company_val == 'company') if isinstance(is_company_val, str) else bool(is_company_val)
+                    if isinstance(is_company_val, str):
+                        is_company = (is_company_val == 'company')
+                    else:
+                        is_company = bool(is_company_val)
 
-                    # País/estado remotos (si vienen M2O tomamos el nombre)
                     rc = g('country_id')
-                    remote_country_name = rc[1] if isinstance(rc, (list, tuple)) and len(rc) >= 2 else None
+                    remote_country_name = self._m2o_name(rc)
                     rs = g('state_id')
-                    remote_state_name = rs[1] if isinstance(rs, (list, tuple)) and len(rs) >= 2 else None
+                    remote_state_name = self._m2o_name(rs)
 
                     country_id = self._find_country_by_name(remote_country_name) if remote_country_name else False
                     state_id = self._find_state_by_name(country_id, remote_state_name) if (country_id and remote_state_name) else False
                     city = self._find_city_commune(city_in)
 
-                    # Tipos fiscales (opcionales)
                     id_type_id = False
                     id_type_val = g('id_type')
                     if self._local_field_exists('res.partner', 'l10n_latam_identification_type_id'):
@@ -480,24 +531,18 @@ class ProductMigration(models.Model):
                         else:
                             sii_taxpayer_type = self._find_cl_taxpayer_type(taxpayer_val)
 
-                    # === ACTECO IDS (many2many) ===
+                    # acteco remoto -> ids locales
                     local_acteco_ids = []
-                    remote_actecos = []
-                    if mapping.get('acteco_ids') and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', mapping['acteco_ids']):
-                        raw_actecos = rp.get(mapping['acteco_ids'])
-                        if isinstance(raw_actecos, (list, tuple)) and raw_actecos:
-                            remote_actecos = list(raw_actecos)
+                    if has_acteco_local and 'acteco_ids' in mapping:
+                        raw = g('acteco_ids') or []
+                        if isinstance(raw, list) and raw and isinstance(raw[0], int):
+                            local_acteco_ids = self._map_remote_actecos_to_local(models, self.db, uid, self.password, raw, create_missing=True)
 
-                    if remote_actecos and self._local_field_exists('res.partner', 'acteco_ids'):
-                        local_acteco_ids = self._map_remote_actecos_to_local(models, self.db, uid, self.password, remote_actecos)
-
-                    # Localizar partner local
                     local = _find_local({'vat': vat, 'email': email, 'name': name, 'city': city})
 
-                    # Vals entrantes (completos)
                     incoming = {
                         'is_company': is_company,
-                        'name': name,
+                        'name': name or email or vat or 'Sin Nombre',
                         'street': street,
                         'street2': street2,
                         'city': city,
@@ -522,40 +567,41 @@ class ProductMigration(models.Model):
                     if sii_taxpayer_type:
                         incoming['l10n_cl_sii_taxpayer_type'] = sii_taxpayer_type
 
-                    # Política para acteco_ids
-                    if local_acteco_ids and self._local_field_exists('res.partner', 'acteco_ids'):
-                        if local and local.id:
-                            if force_overwrite:
-                                incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
-                            elif merge_actecos and not self._is_empty_val(local.acteco_ids):
-                                merged = list(set(local.acteco_ids.ids) | set(local_acteco_ids))
-                                if set(merged) != set(local.acteco_ids.ids):
-                                    incoming['acteco_ids'] = [(6, 0, merged)]
-                            elif self._is_empty_val(local.acteco_ids):
-                                incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
-                        else:
-                            incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
-
-                    # Crear o actualizar respetando política de overwrite
                     if local and local.id:
                         vals_write = incoming if force_overwrite else self._merge_fill_missing(local, incoming)
                         if vals_write:
                             local.write(vals_write)
+                            updated += 1
                             _logger.info(f"[PARTNER] Actualizado: {local.display_name} -> {list(vals_write.keys())}")
+                        if has_acteco_local and local_acteco_ids:
+                            if merge_actecos:
+                                new_set = list(sorted(set(local.acteco_ids.ids).union(local_acteco_ids)))
+                                if set(new_set) != set(local.acteco_ids.ids):
+                                    local.write({'acteco_ids': [(6, 0, new_set)]})
+                                    merged_act += 1
+                            else:
+                                local.write({'acteco_ids': [(6, 0, local_acteco_ids)]})
+                                replaced_act += 1
                     else:
                         local = Partner.create(incoming)
+                        created += 1
                         _logger.info(f"[PARTNER] Creado: {local.display_name}")
+                        if has_acteco_local and local_acteco_ids:
+                            local.write({'acteco_ids': [(6, 0, local_acteco_ids)]})
+                            replaced_act += 1
 
                     processed += 1
                     if processed % commit_every == 0:
                         self.env.cr.commit()
-                        _logger.info(f"[PARTNER] Proceso parcial: {processed}/{total}")
+                        _logger.info(f"[PARTNER] Parcial: proc={processed}/{total}, creados={created}, actualizados={updated}, acteco_merge={merged_act}, acteco_set={replaced_act}")
 
                 except Exception as e:
+                    # No tumbar lo ya creado desde el último commit
                     self.env.cr.rollback()
-                    _logger.error(f"[PARTNER] Error migrando '{rp.get('name')}' : {e}")
+                    _logger.error(f"[PARTNER] Error migrando '{self._to_text(rp.get('name'))}' : {e}")
 
-        _logger.info(f"[PARTNER] Finalizado. Total procesados: {processed}")
+        self.env.cr.commit()
+        _logger.info(f"[PARTNER] FIN — proc={processed}, creados={created}, actualizados={updated}, acteco_merge={merged_act}, acteco_set={replaced_act}")
         return True
 
     # =========================
