@@ -287,18 +287,25 @@ class ProductMigration(models.Model):
     # =========================
     # CONTACTOS – Migración (fill-missing)
     # =========================
-    def migrate_contacts(self, commit_every=100, force_overwrite=False):
+    def migrate_contacts(self, commit_every=100, force_overwrite=False, merge_actecos=False):
         """
-        Migra contactos desde Odoo remoto.
-        Por defecto **NO sobrescribe**: solo completa campos vacíos del contacto local.
-        Si `force_overwrite=True`, sobrescribe con los valores remotos.
+        Migra contactos desde Odoo remoto (12 -> 16).
+        - No sobrescribe por defecto: completa campos vacíos (fill-missing).
+        - force_overwrite=True: sobrescribe todo.
+        - merge_actecos=True: fusiona acteco_ids (many2many) en vez de reemplazar.
         """
         uid, models = self.connect_to_odoo()
 
-        # Campos remotos (alias-safe)
+        # 1) Campos remotos disponibles y mapeo lógico -> real
         mapping, fields_to_read = self._build_remote_contact_fields(models, self.db, uid, self.password)
 
-        # IDs remotos
+        # Asegurar que leemos acteco_ids si existe en remoto
+        if 'acteco_ids' not in mapping and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', 'acteco_ids'):
+            mapping['acteco_ids'] = 'acteco_ids'
+            if 'acteco_ids' not in fields_to_read:
+                fields_to_read.append('acteco_ids')
+
+        # 2) Ids remotos a procesar
         partner_ids = models.execute_kw(self.db, uid, self.password, 'res.partner', 'search', [[]])
         total = len(partner_ids)
         _logger.info(f"[PARTNER] Remotos a procesar: {total}")
@@ -306,7 +313,7 @@ class ProductMigration(models.Model):
 
         Partner = self.env['res.partner'].sudo()
 
-        # Índices locales por vat y email para acelerar
+        # 3) Índices locales para acelerar búsqueda por vat/email
         vat_idx = {self._norm_rut(p.vat): p.id for p in Partner.search([('vat', '!=', False)])}
         email_idx = {self._norm_email(p.email): p.id for p in Partner.search([('email', '!=', False)])}
 
@@ -332,7 +339,7 @@ class ProductMigration(models.Model):
 
             for rp in partners:
                 try:
-                    # extractor remoto g() usando mapping
+                    # Helper para extraer respetando mapping
                     def g(key, default=None):
                         f = mapping.get(key)
                         return rp.get(f) if f else default
@@ -351,13 +358,11 @@ class ProductMigration(models.Model):
                     function = self._norm_str(g('function'))
                     giro = self._norm_str(g('giro'))
 
+                    # is_company: puede venir como 'company' o boolean
                     is_company_val = g('is_company')
-                    if isinstance(is_company_val, str):
-                        is_company = (is_company_val == 'company')
-                    else:
-                        is_company = bool(is_company_val)
+                    is_company = (is_company_val == 'company') if isinstance(is_company_val, str) else bool(is_company_val)
 
-                    # país/estado remotos (si vienen M2O tomamos el nombre)
+                    # País/estado remotos (si vienen M2O tomamos el nombre)
                     rc = g('country_id')
                     remote_country_name = rc[1] if isinstance(rc, (list, tuple)) and len(rc) >= 2 else None
                     rs = g('state_id')
@@ -367,7 +372,7 @@ class ProductMigration(models.Model):
                     state_id = self._find_state_by_name(country_id, remote_state_name) if (country_id and remote_state_name) else False
                     city = self._find_city_commune(city_in)
 
-                    # tipos fiscales (opcionales)
+                    # Tipos fiscales (opcionales)
                     id_type_id = False
                     id_type_val = g('id_type')
                     if self._local_field_exists('res.partner', 'l10n_latam_identification_type_id'):
@@ -384,10 +389,21 @@ class ProductMigration(models.Model):
                         else:
                             sii_taxpayer_type = self._find_cl_taxpayer_type(taxpayer_val)
 
-                    # localizar partner local
+                    # === ACTECO IDS (many2many) ===
+                    local_acteco_ids = []
+                    remote_actecos = []
+                    if mapping.get('acteco_ids') and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', mapping['acteco_ids']):
+                        raw_actecos = rp.get(mapping['acteco_ids'])
+                        if isinstance(raw_actecos, (list, tuple)) and raw_actecos:
+                            remote_actecos = list(raw_actecos)
+
+                    if remote_actecos and self._local_field_exists('res.partner', 'acteco_ids'):
+                        local_acteco_ids = self._map_remote_actecos_to_local(models, self.db, uid, self.password, remote_actecos)
+
+                    # Localizar partner local
                     local = _find_local({'vat': vat, 'email': email, 'name': name, 'city': city})
 
-                    # vals entrantes (completos)
+                    # Vals entrantes (completos)
                     incoming = {
                         'is_company': is_company,
                         'name': name,
@@ -415,13 +431,26 @@ class ProductMigration(models.Model):
                     if sii_taxpayer_type:
                         incoming['l10n_cl_sii_taxpayer_type'] = sii_taxpayer_type
 
-                    # crear o actualizar respetando datos existentes
+                    # Política para acteco_ids
+                    if local_acteco_ids and self._local_field_exists('res.partner', 'acteco_ids'):
+                        if local and local.id:
+                            if force_overwrite:
+                                incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
+                            elif merge_actecos and not self._is_empty_val(local.acteco_ids):
+                                merged = list(set(local.acteco_ids.ids) | set(local_acteco_ids))
+                                if set(merged) != set(local.acteco_ids.ids):
+                                    incoming['acteco_ids'] = [(6, 0, merged)]
+                            elif self._is_empty_val(local.acteco_ids):
+                                incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
+                        else:
+                            incoming['acteco_ids'] = [(6, 0, local_acteco_ids)]
+
+                    # Crear o actualizar respetando política de overwrite
                     if local and local.id:
-                        vals_write = incoming if force_overwrite \
-                                     else self._merge_fill_missing(local, incoming)
+                        vals_write = incoming if force_overwrite else self._merge_fill_missing(local, incoming)
                         if vals_write:
                             local.write(vals_write)
-                            _logger.info(f"[PARTNER] Actualizado (fill_missing): {local.display_name} -> {list(vals_write.keys())}")
+                            _logger.info(f"[PARTNER] Actualizado: {local.display_name} -> {list(vals_write.keys())}")
                     else:
                         local = Partner.create(incoming)
                         _logger.info(f"[PARTNER] Creado: {local.display_name}")
