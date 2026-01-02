@@ -154,6 +154,97 @@ class ProductMigration(models.Model):
     # =========================
 # ===== Helpers de matching por nombre (pegar dentro de ProductMigration) =====
 
+    # --- Helpers faltantes / acteco ---
+
+    def _remote_model_has(self, models, db, uid, password, model_name, field_name):
+        """
+        Devuelve True si el modelo remoto 'model_name' tiene el campo 'field_name'.
+        Es un alias del ya existente _remote_field_exists para mantener compatibilidad.
+        """
+        return self._remote_field_exists(models, db, uid, password, model_name, field_name)
+
+
+    def _map_remote_actecos_to_local(self, models, db, uid, password, remote_ids, create_missing=True):
+        """
+        Recibe IDs de actividades remotas (partner.activities) y devuelve
+        la lista de IDs locales mapeados por prioridad: code -> name.
+        Si create_missing=True, crea la actividad en local si no existe.
+        """
+        if not remote_ids:
+            return []
+
+        # 1) Leer actividades remotas (intenta traer 'code' y 'name')
+        remote_fields = ['id', 'name']
+        # Si el remoto tiene 'code', también lo pedimos
+        try:
+            fields_info = models.execute_kw(db, uid, password, 'partner.activities', 'fields_get', [[], ['string']])
+            if 'code' in fields_info:
+                remote_fields.append('code')
+        except Exception:
+            pass
+
+        # read en lotes por si la lista es larga
+        CHUNK = 200
+        remote_records = []
+        for i in range(0, len(remote_ids), CHUNK):
+            chunk = remote_ids[i:i+CHUNK]
+            recs = models.execute_kw(db, uid, password, 'partner.activities', 'read', [chunk, remote_fields])
+            remote_records.extend(recs or [])
+
+        if not remote_records:
+            return []
+
+        # 2) Preparar índices locales por code y por name (si existen los campos)
+        PA = self.env['partner.activities'].sudo()
+
+        local_has_code = self._local_field_exists('partner.activities', 'code')
+        # Traemos todas las actividades locales una sola vez
+        local_all = PA.search([])
+        by_code = {}
+        by_name = {}
+        for r in local_all:
+            if local_has_code and r.code:
+                by_code[str(r.code).strip().upper()] = r.id
+            if r.name:
+                by_name[str(r.name).strip().upper()] = r.id
+
+        local_ids = []
+
+        for r in remote_records:
+            name = (r.get('name') or '').strip()
+            code = (r.get('code') or '').strip() if 'code' in r else ''
+            key_name = name.upper()
+            key_code = code.upper()
+
+            local_id = False
+
+            # 1) match por code
+            if local_has_code and key_code and key_code in by_code:
+                local_id = by_code[key_code]
+
+            # 2) match por name
+            if not local_id and key_name and key_name in by_name:
+                local_id = by_name[key_name]
+
+            # 3) crear si no existe
+            if not local_id and create_missing:
+                vals = {'name': name}
+                if local_has_code and code:
+                    vals['code'] = code
+                new_rec = PA.create(vals)
+                local_id = new_rec.id
+                # actualizar índices
+                if local_has_code and code:
+                    by_code[key_code] = local_id
+                if name:
+                    by_name[key_name] = local_id
+
+            if local_id:
+                local_ids.append(local_id)
+
+        return list(set(local_ids))  # sin duplicados
+
+
     def _norm_name(self, s):
         s = (s or '').strip().lower()
         # colapsa espacios múltiples
