@@ -255,26 +255,6 @@ class ProductMigration(models.Model):
         return list(set(res))
 
 
-    def _norm_name(self, s):
-        s = (s or '').strip().lower()
-        # colapsa espacios múltiples
-        return ' '.join(s.split())
-
-    def _norm_str(self, v):
-        return (v or '').strip()
-
-    def _norm_email(self, v):
-        return self._norm_str(v).lower()
-
-    def _norm_rut(self, v):
-        """Normaliza RUT: sin puntos/espacios; DV con guion si falta."""
-        if not v:
-            return ''
-        s = str(v).strip().upper().replace('.', '').replace(' ', '')
-        if '-' not in s and len(s) > 1:
-            s = f"{s[:-1]}-{s[-1]}"
-        return s
-
     def _find_country_by_name(self, name):
         if not name:
             return False
@@ -388,27 +368,19 @@ class ProductMigration(models.Model):
     # =========================
     # CONTACTOS – Migración (fill-missing)
     # =========================
+    # ===== Migración de contactos robusta (Odoo 12 -> 16) =====
     def migrate_contacts(self, commit_every=10, force_overwrite=False, merge_actecos=True):
-        """
-        Migra contactos desde Odoo remoto (12 -> 16).
-        - Normaliza valores list/M2O a texto.
-        - Hace commit cada N para no perder avances si hay errores intermedios.
-        """
         uid, models = self.connect_to_odoo()
 
         has_acteco_local = self._local_field_exists('res.partner', 'acteco_ids')
-        if not has_acteco_local:
-            _logger.warning("[PARTNER] Campo acteco_ids no existe en local; se omitirá.")
 
         mapping, fields_to_read = self._build_remote_contact_fields(models, self.db, uid, self.password)
-        # asegurar que pedimos acteco_ids si existe en remoto
-        try:
-            if 'acteco_ids' not in mapping and self._remote_model_has(models, self.db, uid, self.password, 'res.partner', 'acteco_ids'):
+        # pide acteco_ids si existe en remoto
+        if self._remote_model_has(models, self.db, uid, self.password, 'res.partner', 'acteco_ids'):
+            if 'acteco_ids' not in mapping:
                 mapping['acteco_ids'] = 'acteco_ids'
-                if 'acteco_ids' not in fields_to_read:
-                    fields_to_read.append('acteco_ids')
-        except Exception:
-            pass
+            if 'acteco_ids' not in fields_to_read:
+                fields_to_read.append('acteco_ids')
 
         partner_ids = models.execute_kw(self.db, uid, self.password, 'res.partner', 'search', [[]])
         total = len(partner_ids)
@@ -417,6 +389,7 @@ class ProductMigration(models.Model):
 
         Partner = self.env['res.partner'].sudo()
 
+        # índices locales por RUT y email
         vat_idx = {self._norm_rut(p.vat): p.id for p in Partner.search([('vat', '!=', False)])}
         email_idx = {self._norm_email(p.email): p.id for p in Partner.search([('email', '!=', False)])}
 
@@ -437,7 +410,7 @@ class ProductMigration(models.Model):
         processed = created = updated = merged_act = replaced_act = 0
 
         for i in range(0, total, BATCH):
-            batch_ids = partner_ids[i:i+BATCH]
+            batch_ids = partner_ids[i:i + BATCH]
             partners = models.execute_kw(self.db, uid, self.password, 'res.partner', 'read', [batch_ids, fields_to_read])
 
             for rp in partners:
@@ -498,6 +471,7 @@ class ProductMigration(models.Model):
                         if isinstance(raw, list) and raw and isinstance(raw[0], int):
                             local_acteco_ids = self._map_remote_actecos_to_local(models, self.db, uid, self.password, raw, create_missing=True)
 
+                    # localizar/crear
                     local = _find_local({'vat': vat, 'email': email, 'name': name, 'city': city})
 
                     incoming = {
@@ -556,7 +530,6 @@ class ProductMigration(models.Model):
                         _logger.info(f"[PARTNER] Parcial: proc={processed}/{total}, creados={created}, actualizados={updated}, acteco_merge={merged_act}, acteco_set={replaced_act}")
 
                 except Exception as e:
-                    # No tumbar lo ya creado desde el último commit
                     self.env.cr.rollback()
                     _logger.error(f"[PARTNER] Error migrando '{self._to_text(rp.get('name'))}' : {e}")
 
