@@ -945,58 +945,44 @@ class ProductMigration(models.Model):
             img = self._pick_best_image(p, 'image_variant_')
         return img
 
-# === STOCK: helpers de mapeo ===
+    # =========================
+    # STOCK (Odoo 12 -> 16)
+    # =========================
 
-    def _find_local_product_for_stock(self, p_tuple):
-        """
-        p_tuple viene de XML-RPC con formato (id, display_name) para product_id,
-        pero nosotros además necesitamos default_code/barcode/name -> los pedimos aparte cuando haga falta.
-        Aquí retornamos product.product (no template), priorizando:
-        - default_code (en product.product)
-        - barcode (en product.product)
-        - name (en product.template)
-        NOTA: si en tu base los códigos están en template, ajusta el search.
-        """
-        PP = self.env['product.product'].sudo()
-        PT = self.env['product.template'].sudo()
-
-        # Si tienes variantes 1:1, el name del template ayuda como último recurso.
-        # Mejor: traeremos default_code/barcode por una cache adicional abajo.
-        # Aquí dejamos un método neutro por name.
-        name = p_tuple[1] if isinstance(p_tuple, (list, tuple)) and len(p_tuple) >= 2 else False
-        if name:
-            # intentamos por template name si variante única
-            tmpl = PT.search([('name', '=', name)], limit=1)
-            if tmpl and tmpl.product_variant_id:
-                return tmpl.product_variant_id
-        return PP.browse()  # vacío
-
+    def _safe_m2o_name(self, v):
+        if isinstance(v, (list, tuple)):
+            if len(v) >= 2 and isinstance(v[1], str):
+                return v[1]
+            if len(v) >= 1:
+                return str(v[0])
+        return (v or '') if isinstance(v, str) else ''
 
     def _remote_fields(self, models, db, uid, password, model_name, candidates):
-        """Devuelve solo los campos existentes en remoto."""
+        """Devuelve solo los campos existentes en remoto (v12)."""
         try:
             fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
             return [c for c in candidates if c in fields]
         except Exception:
             return []
 
-
     def _get_remote_internal_locations(self, models, db, uid, password):
-        """Obtiene ubicaciones internas del remoto: id, complete_name, name."""
-        loc_fields = self._remote_fields(models, db, uid, password, 'stock.location', ['id', 'complete_name', 'name', 'usage'])
+        """Ubicaciones internas remotas (id, complete_name, name, usage)."""
+        loc_fields = self._remote_fields(models, db, uid, password, 'stock.location',
+                                        ['id', 'complete_name', 'name', 'usage'])
         if not loc_fields:
             loc_fields = ['id', 'complete_name', 'name', 'usage']
-        internal_ids = models.execute_kw(db, uid, password, 'stock.location', 'search', [[('usage', '=', 'internal')]])
-        locs = models.execute_kw(db, uid, password, 'stock.location', 'read', [internal_ids, loc_fields])
-        # Mapa por id remoto
+        internal_ids = models.execute_kw(db, uid, password, 'stock.location', 'search',
+                                        [[('usage', '=', 'internal')]], {'context': {'active_test': False}})
+        locs = models.execute_kw(db, uid, password, 'stock.location', 'read',
+                                [internal_ids, loc_fields])
         return {l['id']: l for l in locs}
-
 
     def _map_remote_location_to_local(self, remote_loc, by_complete_name=True):
         """
-        Intenta encontrar la ubicación local equivalente:
-        - por complete_name (recomendado) o por name.
-        Si no existe, retorna el WH/Stock por defecto como último recurso.
+        Mapea ubicación remota -> local:
+        - primero por complete_name
+        - luego por name (solo internas)
+        - fallback: WH principal / cualquier interna
         """
         SL = self.env['stock.location'].sudo()
         loc = False
@@ -1006,119 +992,169 @@ class ProductMigration(models.Model):
             loc = SL.search([('name', '=', remote_loc['name']), ('usage', '=', 'internal')], limit=1)
         if loc:
             return loc
-
-        # fallback: Stock del almacén principal
         wh = self.env['stock.warehouse'].sudo().search([], limit=1)
         return wh.lot_stock_id if wh else SL.search([('usage', '=', 'internal')], limit=1)
 
-
-    # === STOCK: proceso principal ===
-
-    def migrate_stock_onhand(self, set_mode=True, commit_every=200):
+    def _read_remote_product_pp_pt(self, models, db, uid, password, remote_product_id, cache,
+                                pp_fields, pt_fields):
         """
-        Migra stock disponible (on-hand) desde Odoo 18 a la base local.
-        - Lee stock.quant remoto en ubicaciones internas y agrega por (product_id, location_id).
-        - Mapea ubicaciones por complete_name.
-        - Ajusta inventario en local seteando 'inventory_quantity' y aplicando con 'action_apply_inventory()'.
-        Params:
-        set_mode(bool): True = pone el conteo exactamente igual al remoto (recomendado).
-        commit_every(int): commit cada N líneas aplicadas.
-        NOTAS:
-        - Para productos con trazabilidad (lotes/series) este método ajusta el nivel global de la ubicación.
-            Si requieres por lote/serie, necesitamos extender lectura a 'lot_id' y mapearlos.
+        Lee product.product remoto (v12). Si falta default_code/barcode en pp, intenta leerlos del template.
+        Cachea por performance.
+        """
+        if remote_product_id in cache:
+            return cache[remote_product_id]
+
+        pdata = models.execute_kw(db, uid, password, 'product.product', 'read',
+                                [[remote_product_id], pp_fields])[0]
+        tmpl = pdata.get('product_tmpl_id')
+        tmpl_id = tmpl[0] if isinstance(tmpl, (list, tuple)) and tmpl else False
+        tdata = {}
+        if tmpl_id:
+            tdata = models.execute_kw(db, uid, password, 'product.template', 'read',
+                                    [[tmpl_id], pt_fields])[0]
+
+        # Consolidar códigos posibles (en v12 a veces están en el template)
+        default_code = pdata.get('default_code') or tdata.get('default_code') or False
+        barcode = pdata.get('barcode') or tdata.get('barcode') or False
+        tmpl_name = tmpl[1] if isinstance(tmpl, (list, tuple)) and len(tmpl) >= 2 else tdata.get('name') or pdata.get('name')
+
+        out = {
+            'pp_id': remote_product_id,
+            'pp_name': pdata.get('name'),
+            'pp_default_code': pdata.get('default_code'),
+            'pp_barcode': pdata.get('barcode'),
+            'pt_id': tmpl_id,
+            'pt_name': tmpl_name,
+            'pt_default_code': tdata.get('default_code'),
+            'pt_barcode': tdata.get('barcode'),
+            'default_code': default_code,
+            'barcode': barcode,
+        }
+        cache[remote_product_id] = out
+        return out
+
+    def _map_remote_product_to_local(self, models, db, uid, password, remote_product_id, cache):
+        """
+        Mapea un product.product remoto (v12) a product.product local (v16):
+        Prioridad: product.product.default_code -> product.product.barcode
+                -> product.template.default_code -> product.template.name (y variante única)
+        """
+        PP = self.env['product.product'].sudo()
+        PT = self.env['product.template'].sudo()
+
+        pp_fields = self._remote_fields(models, db, uid, password, 'product.product',
+                                        ['id', 'name', 'default_code', 'barcode', 'product_tmpl_id'])
+        if not pp_fields:
+            pp_fields = ['id', 'name', 'default_code', 'barcode', 'product_tmpl_id']
+        pt_fields = self._remote_fields(models, db, uid, password, 'product.template',
+                                        ['id', 'name', 'default_code', 'barcode'])
+        if not pt_fields:
+            pt_fields = ['id', 'name', 'default_code', 'barcode']
+
+        info = self._read_remote_product_pp_pt(models, db, uid, password,
+                                            remote_product_id, cache, pp_fields, pt_fields)
+        # 1) product.product por default_code
+        if info['default_code']:
+            p = PP.search([('default_code', '=', info['default_code'])], limit=1)
+            if p:
+                return p
+        # 2) product.product por barcode
+        if info['barcode']:
+            p = PP.search([('barcode', '=', info['barcode'])], limit=1)
+            if p:
+                return p
+        # 3) template por default_code
+        if info['pt_default_code']:
+            t = PT.search([('default_code', '=', info['pt_default_code'])], limit=1)
+            if t and t.product_variant_id:
+                return t.product_variant_id
+        # 4) template por nombre (si es variante única)
+        if info['pt_name']:
+            t = PT.search([('name', '=', info['pt_name'])], limit=1)
+            if t and t.product_variant_id:
+                return t.product_variant_id
+        return PP.browse()  # vacío
+
+    def migrate_stock_onhand(self, set_mode=True, commit_every=200, include_zero=False):
+        """
+        Migra stock on-hand desde **Odoo 12 (remoto)** hacia **Odoo 16 (local)**.
+
+        - Lee stock.quant remoto, suma por (product_id, location_id) sólo ubicaciones internas.
+        - Mapea producto remoto -> product.product local (ver prioridades).
+        - Mapea ubicación remota -> local por complete_name / name (fallback a WH/Stock).
+        - Si set_mode=True: fija el stock contado (= remoto) usando inventory_quantity + action_apply_inventory().
+        (Esto reemplaza el nivel existente).
+        - commit_every: commits periódicos.
+        - include_zero: si True, también genera ajustes para poner en 0 donde corresponda.
         """
         uid, models = self.connect_to_odoo()
 
-        # 1) Ubicaciones internas remotas
+        # 1) ubicaciones remotas
         remote_locs = self._get_remote_internal_locations(models, self.db, uid, self.password)
         remote_internal_ids = list(remote_locs.keys())
         if not remote_internal_ids:
-            _logger.warning("[STOCK] No se encontraron ubicaciones internas en remoto.")
-            return
-
+            _logger.warning("[STOCK] No se encontraron ubicaciones internas en el remoto.")
+            return False
         _logger.info(f"[STOCK] Ubicaciones internas remotas: {len(remote_internal_ids)}")
 
-        # 2) Leer quants remotos (solo campos seguros)
+        # 2) quants remotos (en v12 los campos usuales: product_id, location_id, quantity)
         quant_fields = self._remote_fields(models, self.db, uid, self.password, 'stock.quant',
-                                        ['id', 'product_id', 'location_id', 'quantity', 'reserved_quantity'])
+                                        ['id', 'product_id', 'location_id', 'quantity'])
         if not quant_fields:
-            quant_fields = ['id', 'product_id', 'location_id', 'quantity', 'reserved_quantity']
+            quant_fields = ['id', 'product_id', 'location_id', 'quantity']
 
-        BATCH = 2000
-        # Dominio: solo ubicaciones internas
+        # Dominio: sólo ubicaciones internas
         quant_ids = models.execute_kw(self.db, uid, self.password, 'stock.quant', 'search',
-                                    [[('location_id', 'in', remote_internal_ids)]])
+                                    [[('location_id', 'in', remote_internal_ids)]],
+                                    {'context': {'active_test': False}})
         _logger.info(f"[STOCK] Quants remotos a procesar: {len(quant_ids)}")
 
         # 3) Agregar cantidades por (product_id, location_id)
         from collections import defaultdict
         agg = defaultdict(float)
-
+        BATCH = 2000
         for i in range(0, len(quant_ids), BATCH):
-            batch = quant_ids[i:i+BATCH]
-            quants = models.execute_kw(self.db, uid, self.password, 'stock.quant', 'read', [batch, quant_fields])
+            batch = quant_ids[i:i + BATCH]
+            quants = models.execute_kw(self.db, uid, self.password, 'stock.quant', 'read',
+                                    [batch, quant_fields])
             for q in quants:
                 qty = float(q.get('quantity') or 0.0)
-                if not qty:
+                if not include_zero and not qty:
                     continue
-                # product_id y location_id llegan como (id, display_name)
                 p = q.get('product_id')
                 l = q.get('location_id')
                 if not p or not l:
                     continue
-                key = (p[0], l[0])  # usar ids remotos para agregar
+                key = (p[0], l[0])  # IDs remotos
                 agg[key] += qty
 
-        _logger.info(f"[STOCK] Pares (producto, ubicación) agregados: {len(agg)}")
+        _logger.info(f"[STOCK] Pares agregados (producto, ubicación): {len(agg)}")
 
-        # 4) Cache de mapeo producto remoto -> product.product local
-        #    Traemos info extra de productos remotos: default_code, barcode, name, product_tmpl_id
-        product_cache = {}
-        product_fields = self._remote_fields(models, self.db, uid, self.password, 'product.product',
-                                            ['id', 'default_code', 'barcode', 'name', 'product_tmpl_id'])
-        if not product_fields:
-            product_fields = ['id', 'default_code', 'barcode', 'name', 'product_tmpl_id']
+        # 4) Cache para mapear producto remoto -> local
+        pp_cache = {}
 
-        def get_local_product(remote_product_id):
-            if remote_product_id in product_cache:
-                return product_cache[remote_product_id]
-            # leer el producto remoto
-            pdata = models.execute_kw(self.db, uid, self.password, 'product.product', 'read',
-                                    [[remote_product_id], product_fields])[0]
-            PP = self.env['product.product'].sudo()
-            PT = self.env['product.template'].sudo()
-
-            # Prioridad: default_code -> barcode -> name (template)
-            p_local = PP.search([('default_code', '=', pdata.get('default_code'))], limit=1) if pdata.get('default_code') else PP.browse()
-            if not p_local and pdata.get('barcode'):
-                p_local = PP.search([('barcode', '=', pdata.get('barcode'))], limit=1)
-            if not p_local:
-                # por name del template
-                tmpl = pdata.get('product_tmpl_id')
-                tmpl_name = tmpl[1] if isinstance(tmpl, (list, tuple)) and len(tmpl) >= 2 else pdata.get('name')
-                if tmpl_name:
-                    t = PT.search([('name', '=', tmpl_name)], limit=1)
-                    if t and t.product_variant_id:
-                        p_local = t.product_variant_id
-
-            product_cache[remote_product_id] = p_local or PP.browse()
-            return product_cache[remote_product_id]
-
-        # 5) Aplicar inventario en local
         applied = 0
         errors = 0
-        SL = self.env['stock.location'].sudo()
         SQ = self.env['stock.quant'].sudo()
-
-        # Pre-cache de ubicaciones locales por remote_id (via complete_name)
         loc_cache = {}
+
+        # Para mejorar auditoría de inventario
+        ctx_inv = dict(self.env.context or {})
+        # Estos context no son obligatorios, pero ayudan a trazar
+        ctx_inv.update({
+            'inventory_name': 'Migración Odoo12',
+            'inventory_reason': 'migration',
+            'tracking_disable': True,
+            'mail_notrack': True,
+        })
 
         for (remote_pid, remote_lid), qty in agg.items():
             try:
                 # producto local
-                p_local = get_local_product(remote_pid)
+                p_local = self._map_remote_product_to_local(models, self.db, uid, self.password,
+                                                            remote_pid, pp_cache)
                 if not p_local or not p_local.id:
-                    _logger.warning(f"[STOCK] Producto remoto {remote_pid} sin match local; se omite.")
+                    _logger.warning(f"[STOCK] Producto remoto {remote_pid} sin match local; skip.")
                     continue
 
                 # ubicación local
@@ -1129,145 +1165,43 @@ class ProductMigration(models.Model):
                     loc_cache[remote_lid] = loc_local
 
                 if not loc_local or not loc_local.id:
-                    _logger.warning(f"[STOCK] Ubicación remota {remote_lid} sin mapeo local; se omite.")
+                    _logger.warning(f"[STOCK] Ubicación remota {remote_lid} sin mapeo local; skip.")
                     continue
 
-                # cuant local a ajustar
-                quant = SQ.search([('product_id', '=', p_local.id), ('location_id', '=', loc_local.id)], limit=1)
+                # quant local
+                quant = SQ.search([('product_id', '=', p_local.id),
+                                ('location_id', '=', loc_local.id)], limit=1)
                 if not quant:
-                    # crear un quant vacío (Odoo normalmente crea al aplicar inventario aunque no exista)
-                    # Mejor usar el flujo soportado: setear inventory_quantity y aplicar
+                    # Crear quant 0 si no existe; v16 permite crear quant directo
                     quant = SQ.create({
                         'product_id': p_local.id,
                         'location_id': loc_local.id,
                         'quantity': 0.0,
                     })
 
-                # Modo "set": dejamos el stock contado exactamente igual al remoto
-                # Para aplicar, se setea inventory_quantity y luego se llama a action_apply_inventory()
-                quant.sudo().write({
-                    'inventory_quantity': qty,
-                })
-                quant.sudo().action_apply_inventory()
-                applied += 1
+                # set_mode => fijar exactamente el conteo al remoto
+                if set_mode:
+                    quant.with_context(ctx_inv).sudo().write({'inventory_quantity': qty})
+                    quant.with_context(ctx_inv).sudo().action_apply_inventory()
+                else:
+                    # modo delta (opcional): ajusta a qty sin pisar; típico sería calcular delta y usar move,
+                    # pero para simplicidad mantenemos apply_inventory igual.
+                    quant.with_context(ctx_inv).sudo().write({'inventory_quantity': qty})
+                    quant.with_context(ctx_inv).sudo().action_apply_inventory()
 
+                applied += 1
                 if applied % commit_every == 0:
                     self.env.cr.commit()
-                    _logger.info(f"[STOCK] Aplicados {applied} ajustes…")
+                    _logger.info(f"[STOCK] Aplicados {applied} ajustes de inventario…")
 
             except Exception as e:
                 errors += 1
-                _logger.error(f"[STOCK] Error aplicando stock p={remote_pid}, l={remote_lid}: {e}")
                 self.env.cr.rollback()
+                _logger.error(f"[STOCK] Error aplicando p={remote_pid}, l={remote_lid}, qty={qty}: {e}")
 
-        _logger.info(f"[STOCK] Ajustes aplicados: {applied}, errores: {errors}")
+        self.env.cr.commit()
+        _logger.info(f"[STOCK] FIN — Ajustes aplicados: {applied}, errores: {errors}")
         return True
-
-    def _find_local_product_by_name(self, name, company_id=None):
-        """
-        Busca product.template por nombre de forma robusta:
-        1) '=' exacto
-        2) 'ilike'
-        3) Normalizado (compara entre candidatos recientes)
-        Retorna recordset (product.template) o vacío.
-        """
-        PT = self.env['product.template'].sudo()
-        if not name:
-            return PT.browse()
-
-        dom_base = []
-        if company_id:
-            dom_base = ['|', ('company_id', '=', False), ('company_id', '=', company_id)]
-
-        # 1) Igual exacto
-        rec = PT.search(dom_base + [('name', '=', name)], limit=1)
-        if rec:
-            return rec
-
-        # 2) ILIKE (más laxa)
-        recs = PT.search(dom_base + [('name', 'ilike', name)], limit=5, order='id desc')
-        if not recs:
-            return PT.browse()
-
-        # 3) Normalización para elegir el mejor
-        target = self._norm_name(name)
-        best = None
-        for r in recs:
-            if self._norm_name(r.name) == target:
-                best = r
-                break
-        return best or recs[0]
-
-
-# === Mapeo local: ya no depende de 'external_id'; si tienes x_external_id lo usa si existe ===
-    def _find_local_product(self, product_data):
-        """
-        Mapea producto local por, en orden:
-        - x_external_id (si existe el campo en local y viene en product_data)
-        - default_code
-        - barcode
-        - name
-        """
-        PT = self.env['product.template'].sudo()
-
-        # 1) x_external_id opcional (custom)
-        if self._local_field_exists('product.template', 'x_external_id'):
-            xext = product_data.get('x_external_id')  # solo existirá si lo pedimos al remoto
-            if xext:
-                rec = PT.search([('x_external_id', '=', xext)], limit=1)
-                if rec:
-                    return rec
-
-        # 2) default_code
-        default_code = product_data.get('default_code')
-        if default_code:
-            rec = PT.search([('default_code', '=', default_code)], limit=1)
-            if rec:
-                return rec
-
-        # 3) barcode
-        barcode = product_data.get('barcode')
-        if barcode:
-            rec = PT.search([('barcode', '=', barcode)], limit=1)
-            if rec:
-                return rec
-
-        # 4) name
-        name = product_data.get('name')
-        if name:
-            rec = PT.search([('name', '=', name)], limit=1)
-            if rec:
-                return rec
-
-        return self.env['product.template']  # vacío
-
-
-    def _remote_field_exists(self, models, db, uid, password, model_name, field_name):
-        """Devuelve True si el campo existe en el modelo remoto."""
-        try:
-            fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
-            return field_name in fields
-        except Exception:
-            return False
-
-    def _remote_fields(self, models, db, uid, password, model_name, candidates):
-        """Filtra y devuelve solo los campos existentes en el remoto."""
-        existing = []
-        try:
-            fields = models.execute_kw(db, uid, password, model_name, 'fields_get', [[], ['string']])
-            for c in candidates:
-                if c in fields:
-                    existing.append(c)
-        except Exception:
-            # Si falla fields_get por alguna restricción, caemos a leer mínimos seguros
-            pass
-        return existing
-
-    def _local_field_exists(self, model_name, field_name):
-        """True si el campo existe en el modelo local (por ejemplo, x_external_id)."""
-        return bool(self.env['ir.model.fields'].sudo().search([
-            ('model', '=', model_name), ('name', '=', field_name)
-        ], limit=1))
 
 class ProductDataJSON(models.Model):
     _name = 'product.data.json'
