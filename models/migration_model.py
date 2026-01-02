@@ -155,9 +155,9 @@ class ProductMigration(models.Model):
 # ===== Helpers de matching por nombre (pegar dentro de ProductMigration) =====
 
     # --- Helpers faltantes / acteco ---
-    # --- Helpers robustos ---
+    # ===== Helpers robustos =====
     def _m2o_name(self, v):
-        """Devuelve etiqueta de un many2one leído por XML-RPC: (id, name) -> name"""
+        """Devuelve etiqueta de un many2one leído por XML-RPC: (id, name) -> name."""
         if isinstance(v, (list, tuple)):
             if len(v) >= 2 and isinstance(v[1], str):
                 return v[1]
@@ -167,11 +167,10 @@ class ProductMigration(models.Model):
         return v or ''
 
     def _to_text(self, v):
-        """Normaliza a texto seguro para campos char/email/phone, tolerando listas, bytes, números."""
-        if v is None or v is False:
+        """Normaliza a texto para Char/Email/Phone, tolerando list/tuple/bytes/números/bool."""
+        if v in (None, False):
             return ''
         if isinstance(v, (list, tuple)):
-            # Si es M2O o lista simple, tomar la etiqueta más “humana”
             return self._to_text(self._m2o_name(v))
         if isinstance(v, bytes):
             try:
@@ -190,109 +189,70 @@ class ProductMigration(models.Model):
     def _norm_email(self, v):
         return self._to_text(v).lower()
 
+    def _norm_name(self, s):
+        s = self._to_text(s).lower()
+        return ' '.join(s.split())  # colapsa espacios
+
     def _norm_rut(self, v):
+        """
+        Normaliza RUT: sin puntos/espacios/prefijo país; DV con guion.
+        Ej: 'CL 76.624.4858' -> '76624485-8'
+        """
         s = self._to_text(v).upper().replace('.', '').replace(' ', '')
         if not s:
             return ''
+        # quita prefijo de país tipo CL / CHL / CL-:
+        while s and s[0].isalpha():
+            s = s[1:]
+        if s.startswith('-'):
+            s = s[1:]
+        # si no trae guion y tiene largo > 1, separa DV:
         if '-' not in s and len(s) > 1:
             s = f"{s[:-1]}-{s[-1]}"
-        # Si viene con prefijo CL, mantenerlo
-        if not s.startswith('CL') and any(ch.isalpha() for ch in s[:2]):
-            pass
         return s
 
+    # (por si no la tienes aún)
+    def _remote_model_has(self, models, db, uid, password, model, field):
+        try:
+            fields = models.execute_kw(db, uid, password, model, 'fields_get', [[], ['string']])
+            return field in fields
+        except Exception:
+            return False
 
-
-
-
-
-    def _remote_model_has(self, models, db, uid, password, model_name, field_name):
-        """
-        Devuelve True si el modelo remoto 'model_name' tiene el campo 'field_name'.
-        Es un alias del ya existente _remote_field_exists para mantener compatibilidad.
-        """
-        return self._remote_field_exists(models, db, uid, password, model_name, field_name)
-
-
+    # (fallback mínimo para actecos si no lo tenías aún)
     def _map_remote_actecos_to_local(self, models, db, uid, password, remote_ids, create_missing=True):
         """
-        Recibe IDs de actividades remotas (partner.activities) y devuelve
-        la lista de IDs locales mapeados por prioridad: code -> name.
-        Si create_missing=True, crea la actividad en local si no existe.
+        Mapea l10n_cl.acteco (si existe). Busca por 'code' o 'name' remoto y devuelve ids locales.
         """
-        if not remote_ids:
-            return []
-
-        # 1) Leer actividades remotas (intenta traer 'code' y 'name')
-        remote_fields = ['id', 'name']
-        # Si el remoto tiene 'code', también lo pedimos
+        res = []
+        if not self._local_field_exists('res.partner', 'acteco_ids'):
+            return res
         try:
-            fields_info = models.execute_kw(db, uid, password, 'partner.activities', 'fields_get', [[], ['string']])
-            if 'code' in fields_info:
-                remote_fields.append('code')
+            # lee code y name del remoto (modelo varía por módulo; usual: l10n_cl.acteco)
+            model = 'l10n_cl.acteco'
+            if not self._remote_model_has(models, db, uid, password, model, 'name'):
+                return res
+            recs = models.execute_kw(db, uid, password, model, 'read', [remote_ids, ['id', 'name', 'code']])
+            L = self.env['l10n_cl.acteco'].sudo()
+            for r in recs:
+                code = (r.get('code') or '').strip()
+                name = (r.get('name') or '').strip()
+                dom = []
+                if code:
+                    dom = ['|', ('code', '=', code), ('name', '=', name)]
+                elif name:
+                    dom = [('name', '=', name)]
+                act = L.search(dom, limit=1) if dom else L.browse()
+                if not act and create_missing and name:
+                    vals = {'name': name}
+                    if 'code' in L._fields and code:
+                        vals['code'] = code
+                    act = L.create(vals)
+                if act:
+                    res.append(act.id)
         except Exception:
             pass
-
-        # read en lotes por si la lista es larga
-        CHUNK = 200
-        remote_records = []
-        for i in range(0, len(remote_ids), CHUNK):
-            chunk = remote_ids[i:i+CHUNK]
-            recs = models.execute_kw(db, uid, password, 'partner.activities', 'read', [chunk, remote_fields])
-            remote_records.extend(recs or [])
-
-        if not remote_records:
-            return []
-
-        # 2) Preparar índices locales por code y por name (si existen los campos)
-        PA = self.env['partner.activities'].sudo()
-
-        local_has_code = self._local_field_exists('partner.activities', 'code')
-        # Traemos todas las actividades locales una sola vez
-        local_all = PA.search([])
-        by_code = {}
-        by_name = {}
-        for r in local_all:
-            if local_has_code and r.code:
-                by_code[str(r.code).strip().upper()] = r.id
-            if r.name:
-                by_name[str(r.name).strip().upper()] = r.id
-
-        local_ids = []
-
-        for r in remote_records:
-            name = (r.get('name') or '').strip()
-            code = (r.get('code') or '').strip() if 'code' in r else ''
-            key_name = name.upper()
-            key_code = code.upper()
-
-            local_id = False
-
-            # 1) match por code
-            if local_has_code and key_code and key_code in by_code:
-                local_id = by_code[key_code]
-
-            # 2) match por name
-            if not local_id and key_name and key_name in by_name:
-                local_id = by_name[key_name]
-
-            # 3) crear si no existe
-            if not local_id and create_missing:
-                vals = {'name': name}
-                if local_has_code and code:
-                    vals['code'] = code
-                new_rec = PA.create(vals)
-                local_id = new_rec.id
-                # actualizar índices
-                if local_has_code and code:
-                    by_code[key_code] = local_id
-                if name:
-                    by_name[key_name] = local_id
-
-            if local_id:
-                local_ids.append(local_id)
-
-        return list(set(local_ids))  # sin duplicados
+        return list(set(res))
 
 
     def _norm_name(self, s):
