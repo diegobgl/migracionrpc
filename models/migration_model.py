@@ -113,13 +113,6 @@ class ProductMigration(models.Model):
 
 
     # =========================
-    # MIGRACIÓN DE IMÁGENES (128)
-    # =========================
-
-        except Exception as e:
-            _logger.error(f"Error durante la migración de imágenes 128: {e}")
-
-    # =========================
     # MIGRACIÓN DE CONTACTOS
     # =========================
     # =========================
