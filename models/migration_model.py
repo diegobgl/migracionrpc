@@ -115,33 +115,6 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE IMÁGENES (128)
     # =========================
-    def copiar_imagenes_productos(self):
-        """
-        Copia las imágenes de productos de tamaño 128x128 desde remoto a local.
-        Busca por nombre y setea image_128 si no existe en local.
-        """
-        uid, models = self.connect_to_odoo()
-
-        try:
-            productos_remoto = self.execute_kw_with_retry(
-                models, self.db, uid, self.password,
-                'product.template', 'search', [[('name', '!=', False)]],
-            )
-            _logger.info(f"Total de productos para migrar imagen 128: {len(productos_remoto)}")
-
-            for product_id in productos_remoto:
-                if product_id > 0:
-                    datos_imagen = self.execute_kw_with_retry(
-                        models, self.db, uid, self.password,
-                        'product.template', 'read', [[product_id], ['image_128', 'name']]
-                    )
-                    if datos_imagen and datos_imagen[0].get('image_128'):
-                        producto_local = self.env['product.template'].search([('name', '=', datos_imagen[0]['name'])], limit=1)
-                        if producto_local and not producto_local.image_128:
-                            producto_local.image_128 = datos_imagen[0]['image_128']
-                            _logger.info(f"Imagen 128 actualizada para '{producto_local.name}'.")
-
-            _logger.info("Migración de imágenes 128 completada.")
 
         except Exception as e:
             _logger.error(f"Error durante la migración de imágenes 128: {e}")
@@ -696,164 +669,105 @@ class ProductMigration(models.Model):
     # =========================
     # MIGRACIÓN DE IMÁGENES (1920) CON CONVERSIÓN
     # =========================
-    def migrate_product_images(self, force=False, prefer_variant=False, only_missing=True, batch_size=100, limit=None):
+    def migrate_product_images(self, limit=None, commit_every=50):
         """
-        Copia imágenes desde Odoo remoto y escribe image_1920 en productos locales.
+        Migra imágenes desde Odoo remoto (12–17) hacia local (13+).
+        Fuente: product.product (image_variant / image)
+        Destino: product.template.image_1920
+        """
 
-        - Soporta Odoo 12 (image, image_medium, image_small) y 13+ (image_*/image_variant_*).
-        - Lee binarios completos (bin_size=False) para obtener base64 real.
-        - Prioriza 1920; si no hay, baja a 1024/512/256/128; si prefer_variant=True, invierte prioridad.
-        - only_missing=True -> solo actualiza productos que NO tienen image_1920.
-        - Matching local: x_external_id -> default_code -> barcode -> nombre (robusto).
-        """
         uid, models = self.connect_to_odoo()
 
-        # 1) IDs remotos
-        try:
-            remote_ids = self.execute_kw_with_retry(
-                models, self.db, uid, self.password,
-                'product.template', 'search', [[('active', '=', True)]]
-            )
-            if limit:
-                remote_ids = remote_ids[:limit]
-        except Exception as e:
-            _logger.error(f"[IMG] No se pudieron obtener IDs remotos: {e}")
-            return False
-
-        total = len(remote_ids)
-        _logger.info(
-            f"[IMG] Productos remotos a revisar: {total} "
-            f"(batch={batch_size}, limit={limit}, only_missing={only_missing}, force={force}, prefer_variant={prefer_variant})"
+        # 1) IDs de variantes remotas
+        remote_pp_ids = self.execute_kw_with_retry(
+            models, self.db, uid, self.password,
+            'product.product', 'search', [[]]
         )
+        if limit:
+            remote_pp_ids = remote_pp_ids[:limit]
 
-        # 2) Campos remotos (incluye modernos y legados)
-        base_candidates = [
-            'id', 'name', 'default_code', 'barcode',
-            # modernos (13+)
-            'image_1920', 'image_1024', 'image_512', 'image_256', 'image_128',
-            'image_variant_1920', 'image_variant_1024', 'image_variant_512', 'image_variant_256', 'image_variant_128',
-            # legados (12)
-            'image', 'image_medium', 'image_small',
-            # opcional
-            'x_external_id',
-        ]
-        fields_to_read = self._remote_fields(models, self.db, uid, self.password, 'product.template', base_candidates)
-        if 'id' not in fields_to_read:
-            fields_to_read.insert(0, 'id')
-        if 'name' not in fields_to_read:
-            fields_to_read.insert(1, 'name')
+        _logger.info("[IMG] Variantes remotas a procesar: %s", len(remote_pp_ids))
 
-        # Helpers
-        import hashlib, base64
+        updated = skipped = nomatch = noimg = errors = 0
 
-        def _sha1_b64(b64str):
-            if not b64str:
-                return None
-            try:
-                raw = base64.b64decode(b64str) if isinstance(b64str, str) else b64str
-            except Exception:
-                raw = (b64str or '').encode('utf-8') if isinstance(b64str, str) else b''
-            return hashlib.sha1(raw).hexdigest()
+        # 2) Campos reales Odoo 12
+        fields = ['id', 'product_tmpl_id', 'image_variant', 'image', 'default_code', 'barcode']
 
-        def _pick_best(p):
-            """
-            Devuelve el mejor base64 disponible, soportando campos modernos (13+)
-            y legados (Odoo 12):
-            - Modernos plantilla: image_1920/1024/512/256/128
-            - Modernos variante:  image_variant_*
-            - Legado plantilla:   image, image_medium, image_small
-            """
-            def pick(prefix):
-                for size in ('1920', '1024', '512', '256', '128'):
-                    k = f'{prefix}{size}'
-                    if p.get(k):
-                        return p[k]
-                return None
+        for i in range(0, len(remote_pp_ids), 100):
+            batch = remote_pp_ids[i:i + 100]
 
-            legacy = p.get('image') or p.get('image_medium') or p.get('image_small')
-
-            if prefer_variant:
-                return pick('image_variant_') or pick('image_') or legacy
-            else:
-                return pick('image_') or pick('image_variant_') or legacy
-
-        updated = skipped_same = skipped_hasimg = noimg_remote = nomatch_local = errors = 0
-
-        for i in range(0, total, batch_size):
-            batch_ids = remote_ids[i:i + batch_size]
-            try:
-                products = self.execute_kw_with_retry(
-                    models, self.db, uid, self.password,
-                    'product.template', 'read',
-                    [batch_ids, fields_to_read],
-                    {'context': {'bin_size': False}}  # <- trae base64 completo
-                )
-            except Exception as e:
-                _logger.error(f"[IMG] Fallo leyendo batch {i}-{i+batch_size}: {e}")
-                continue
+            products = self.execute_kw_with_retry(
+                models, self.db, uid, self.password,
+                'product.product', 'read',
+                [batch, fields],
+                {'context': {'bin_size': False}}  # 🔴 CLAVE
+            )
 
             for p in products:
                 try:
-                    # 3) Imagen remota
-                    img_b64 = _pick_best(p)
-                    if not img_b64 or isinstance(img_b64, int):
-                        # int => bin_size=True (tamaño en bytes); o no hay imagen
-                        if isinstance(img_b64, int):
-                            _logger.warning("[IMG] Imagen llegó como entero (bin_size activo). "
-                                            "Revisa context bin_size=False. Remoto id=%s name=%s",
-                                            p.get('id'), p.get('name'))
-                        noimg_remote += 1
+                    # 3) Tomar imagen real
+                    img = p.get('image_variant') or p.get('image')
+                    if not img or isinstance(img, int):
+                        noimg += 1
                         continue
 
-                    # 4) Resolver producto local (smart + nombre robusto)
-                    local_prod = self._find_local_product(p)
-                    if not local_prod or not local_prod.id:
-                        local_prod = self._find_local_product_by_name(p.get('name'))
-
-                    if not local_prod or not local_prod.id:
-                        nomatch_local += 1
-                        _logger.debug(f"[IMG] Sin match local por nombre: '{p.get('name')}' (id remoto {p.get('id')}).")
+                    # 4) Resolver template remoto
+                    tmpl = p.get('product_tmpl_id')
+                    if not tmpl:
+                        nomatch += 1
                         continue
 
-                    # 5) Filtros de actualización
-                    if only_missing and local_prod.image_1920 and not force:
-                        skipped_hasimg += 1
+                    tmpl_id = tmpl[0]
+
+                    # 5) Buscar template local (orden estable)
+                    local_tmpl = False
+                    if p.get('default_code'):
+                        local_tmpl = self.env['product.template'].search(
+                            [('default_code', '=', p['default_code'])], limit=1
+                        )
+                    if not local_tmpl and p.get('barcode'):
+                        local_tmpl = self.env['product.template'].search(
+                            [('barcode', '=', p['barcode'])], limit=1
+                        )
+                    if not local_tmpl:
+                        local_tmpl = self.env['product.template'].search(
+                            [('name', '=', tmpl[1])], limit=1
+                        )
+
+                    if not local_tmpl:
+                        nomatch += 1
                         continue
 
-                    if local_prod.image_1920 and not force:
-                        if _sha1_b64(local_prod.image_1920) == _sha1_b64(img_b64):
-                            skipped_same += 1
-                            continue
+                    # 6) No pisar si ya tiene imagen
+                    if local_tmpl.image_1920:
+                        skipped += 1
+                        continue
 
-                    # 6) Escribir imagen exacta y limpiar thumbs (fuerza recálculo)
-                    local_prod.sudo().write({
-                        'image_128': False,
-                        'image_256': False,
-                        'image_512': False,
-                        'image_1024': False,
-                        'image_1920': img_b64,
+                    # 7) Escritura canónica
+                    local_tmpl.sudo().write({
+                        'image_1920': img
                     })
                     updated += 1
 
-                    # commits periódicos
-                    if updated % 50 == 0:
+                    if updated % commit_every == 0:
                         self.env.cr.commit()
                         _logger.info(
-                            "[IMG] Parcial: updated=%s, same=%s, hasimg=%s, noimg=%s, nomatch=%s, errors=%s",
-                            updated, skipped_same, skipped_hasimg, noimg_remote, nomatch_local, errors
+                            "[IMG] Parcial updated=%s skipped=%s noimg=%s nomatch=%s errors=%s",
+                            updated, skipped, noimg, nomatch, errors
                         )
 
                 except Exception as e:
                     errors += 1
                     self.env.cr.rollback()
-                    _logger.error(f"[IMG] Error migrando '{p.get('name')}' (remoto {p.get('id')}): {e}")
+                    _logger.error("[IMG] Error procesando pp=%s: %s", p.get('id'), e)
 
         self.env.cr.commit()
         _logger.info(
-            "[IMG] FIN — updated=%s, same=%s, hasimg=%s, noimg_remote=%s, nomatch_local=%s, errors=%s",
-            updated, skipped_same, skipped_hasimg, noimg_remote, nomatch_local, errors
+            "[IMG] FIN updated=%s skipped=%s noimg=%s nomatch=%s errors=%s",
+            updated, skipped, noimg, nomatch, errors
         )
         return True
+
 
     def convertir_y_optimizar_imagen(self, datos_imagen):
         """
